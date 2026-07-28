@@ -47,6 +47,14 @@ inMinNetR    = input.float(1.2,  "Minimum net R to target 1",   group = grpSig, 
 inBlockLunch = input.bool(true,  "Block lunch (11:30-13:30 ET)", group = grpSig)
 inShowZones  = input.bool(true,  "Shade regime background",      group = grpSig)
 
+grpHook = "Webhook (feed your chart to the copilot)"
+inWebhook       = input.bool(false, "Emit bar payload on every close", group = grpHook,
+     tooltip = "Turn on, then create an alert with condition 'Any alert() function call' and " +
+     "point its webhook URL at your running `nqcopilot --serve`. TradingView will POST each " +
+     "closed bar from THIS chart, so the copilot reads exactly what you see.")
+inWebhookSecret = input.string("", "Shared secret", group = grpHook,
+     tooltip = "Must match --secret on the server. Rejects posts from anyone else.")
+
 grpInd = "Indicators"
 inEmaFast = input.int(9,   "EMA fast",   group = grpInd, minval = 1)
 inEmaMid  = input.int(21,  "EMA mid",    group = grpInd, minval = 1)
@@ -362,10 +370,35 @@ alertcondition(goLong,  "NQ Copilot: LONG",  "NQ Copilot LONG — check the pane
 alertcondition(goShort, "NQ Copilot: SHORT", "NQ Copilot SHORT — check the panel for entry, stop and size.")
 alertcondition(blockBreached, "NQ Copilot: BREACH RISK", "Equity is at or below the trailing threshold.")
 
-if goLong or goShort
+// Human-readable signal alert. Use this when you only want to be told to trade.
+if (goLong or goShort) and not inWebhook
     alert((goLong ? "GO LONG " : "GO SHORT ") + str.tostring(qty) + " " + inSymbol +
          " @ " + str.tostring(entryPx, format.mintick) +
          " | stop " + str.tostring(stopPx, format.mintick) +
          " | T1 " + str.tostring(target1, format.mintick) +
          " | " + setupName + " (" + str.tostring(setupScore, "#") + "/100)",
          alert.freq_once_per_bar_close)
+
+// Machine-readable bar payload. Fires on EVERY bar close so the copilot receives
+// a continuous series from this chart rather than only the signal bars.
+//
+// `time` is sent as epoch milliseconds deliberately: building an ISO-8601 string
+// inside Pine requires escaping the literal 'T', and a malformed timestamp would
+// corrupt the bar series silently. A plain integer cannot be misread.
+if inWebhook
+    payload = '{"secret":"' + inWebhookSecret + '"' +
+         ',"symbol":"'   + syminfo.tickerid + '"' +
+         ',"interval":"' + timeframe.period + '"' +
+         ',"time":'      + str.tostring(time, "#") +
+         ',"open":'      + str.tostring(open) +
+         ',"high":'      + str.tostring(high) +
+         ',"low":'       + str.tostring(low) +
+         ',"close":'     + str.tostring(close) +
+         ',"volume":'    + str.tostring(nz(volume, 0), "#.##") +
+         ',"tv_action":"' + (goLong ? "GO LONG" : goShort ? "GO SHORT" :
+              hardBlocked ? "STAND DOWN" : hasSetup ? "FILTERED" : "WAIT") + '"' +
+         ',"tv_setup":"' + (hasSetup ? setupName : "") + '"' +
+         ',"tv_score":' + str.tostring(hasSetup ? setupScore : 0, "#") +
+         ',"tv_regime":"' + regime + '"' +
+         '}'
+    alert(payload, alert.freq_once_per_bar_close)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time as _time
 from dataclasses import asdict
@@ -29,6 +30,7 @@ from .contracts import get_contract
 from .data import DataError, fetch_live, generate_demo_bars, load_csv
 from .market import IndicatorConfig
 from .playbook import Action, Directive, PlaybookConfig, evaluate
+from .webhook import BarStore, WebhookConfig, WebhookContext, WebhookServer
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -160,6 +162,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--trades", action="store_true", help="List every trade from the replay."
     )
 
+    serve = parser.add_argument_group("live feed from TradingView")
+    serve.add_argument(
+        "--serve",
+        action="store_true",
+        help="Receive bars from TradingView alert webhooks and decide on each close.",
+    )
+    serve.add_argument("--port", type=int, default=8787, help="Webhook port (default: 8787).")
+    serve.add_argument(
+        "--bind",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1 — use a tunnel to expose it).",
+    )
+    serve.add_argument(
+        "--secret",
+        help="Shared secret the alert must send. Falls back to NQCOPILOT_WEBHOOK_SECRET.",
+    )
+
     output = parser.add_argument_group("output")
     output.add_argument("--json", action="store_true", help="Emit JSON instead of a card.")
     output.add_argument("--no-color", action="store_true")
@@ -179,6 +198,9 @@ def load_bars(args: argparse.Namespace) -> list[Bar]:
         bars = fetch_live(args.symbol, args.interval, args.lookback)
     elif args.demo:
         bars = generate_demo_bars()
+    elif args.serve:
+        # Serving without a seed is legal: the series builds from the feed.
+        return []
     else:
         raise DataError("choose a data source: --csv PATH, --live, or --demo")
 
@@ -544,6 +566,89 @@ def run_replay(  # noqa: PLR0913 - mirrors run_once's dependencies
     return 0
 
 
+def run_server(
+    args: argparse.Namespace,
+    spec,
+    state: AccountState,
+    bars: list[Bar],
+    engine: RiskEngine,
+    c: Palette,
+) -> int:
+    """Serve the TradingView webhook endpoint and decide on every bar close."""
+    secret = args.secret or os.environ.get("NQCOPILOT_WEBHOOK_SECRET")
+
+    def on_directive(directive, meta) -> None:
+        symbol = meta.get("symbol") or spec.symbol
+        interval = meta.get("interval") or ""
+        banner = f"── {symbol} {interval} bar received ──"
+        print("\n" + c(banner, DIM))
+        print(render(directive, state, spec, c, args.verbose))
+        # Cross-check the chart's own read against the engine's.
+        chart_action = (meta.get("tv_action") or "").replace(" ", "_")
+        if chart_action and chart_action != directive.action.name:
+            print(
+                c(
+                    f"  note: chart said {meta.get('tv_action')}, engine says "
+                    f"{directive.action.value}. Differences usually mean the chart "
+                    f"and the engine disagree on account state — trust the engine, "
+                    f"it knows your threshold.",
+                    YELLOW,
+                )
+            )
+        if args.state:
+            save_state(args.state, state)
+
+    context = WebhookContext(
+        config=WebhookConfig(host=args.bind, port=args.port, secret=secret),
+        spec=spec,
+        state=state,
+        store=BarStore(bars),
+        engine=engine,
+        playbook=PlaybookConfig(min_score=args.min_score),
+        indicators=IndicatorConfig(),
+        on_directive=on_directive,
+    )
+
+    server = WebhookServer(context)
+    print(c("  NQ COPILOT — live feed", BOLD))
+    print(f"    Listening on {c(server.url, CYAN)}")
+    print(f"    Seeded with {len(bars)} bar(s) for {spec.symbol}")
+    if not secret:
+        print(
+            c(
+                "    WARNING: no shared secret set. Anyone who can reach this port "
+                "can inject fake bars. Use --secret.",
+                YELLOW,
+                BOLD,
+            )
+        )
+    if args.bind in ("127.0.0.1", "localhost"):
+        print(
+            c(
+                "    Bound to localhost — TradingView cannot reach it directly. "
+                "Expose it with a tunnel (cloudflared/ngrok) and use that URL.",
+                DIM,
+            )
+        )
+    if len(bars) < 80:
+        print(
+            c(
+                f"    Only {len(bars)} bars seeded; the engine needs ~80 before it "
+                f"will read anything. Seed with --csv for an immediate read.",
+                DIM,
+            )
+        )
+    print(c("    Ctrl-C to stop.\n", DIM))
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
 def run_once(args: argparse.Namespace, c: Palette) -> int:
     spec = get_contract(args.symbol)
     if args.round_turn is not None:
@@ -562,6 +667,9 @@ def run_once(args: argparse.Namespace, c: Palette) -> int:
 
     if news_warning:
         print(c(f"  ! {news_warning}", YELLOW, BOLD), file=sys.stderr)
+
+    if args.serve:
+        return run_server(args, spec, state, bars, engine, c)
 
     if args.backtest:
         return run_replay(args, spec, state, bars, engine, c)

@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 153 tests. A hard rule gate always beats
+These are deterministic and covered by 279 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -92,6 +92,9 @@ nqcopilot --csv nq_5m.csv --symbol MNQ --balance 51200 --threshold 48700
 
 # Live-ish delayed data, refreshing every minute
 nqcopilot --live --symbol MNQ --state ~/.nqcopilot.json --watch 60
+
+# Read your actual TradingView chart, live (see below)
+nqcopilot --serve --csv nq_5m.csv --symbol MNQ
 ```
 
 Output:
@@ -135,11 +138,57 @@ why is training you to click without thinking.
 
 ---
 
+## Live feed from your TradingView chart
+
+The copilot can read **your** chart — your symbol, your timeframe, your data
+feed — without ever touching your TradingView credentials.
+
+The Pine indicator runs on your chart and fires an alert on every bar close;
+TradingView POSTs that bar to a small local server, which evaluates the same
+series you are looking at.
+
+```bash
+# 1. Start the receiver (seed it so it doesn't need 80 bars of warmup)
+export NQCOPILOT_WEBHOOK_SECRET=pick-something-long
+nqcopilot --serve --csv nq_5m.csv --symbol MNQ --state ~/.apex.json
+
+# 2. Expose it — TradingView cannot reach localhost
+cloudflared tunnel --url http://localhost:8787
+```
+
+3. In the indicator settings, tick **Emit bar payload on every close** and paste
+   the same secret.
+4. Create an alert on the chart with condition **"Any alert() function call"**,
+   and set its webhook URL to `https://your-tunnel-url/webhook`.
+
+Every bar close now prints a full decision card, and the account state advances
+exactly as it would live. `GET /health` reports ingestion status; `GET /decision`
+returns the latest read as JSON.
+
+The card also cross-checks the chart's own read against the engine's and tells
+you when they disagree — which usually means the engine knows something about
+your account state that the chart does not.
+
+### Why not just log in to TradingView?
+
+Because it would be worse for you in three concrete ways. TradingView's terms
+prohibit automated access, so a scripted login risks your account. There is no
+bar-data API, so it would mean scraping a private WebSocket with your session
+cookie — which breaks without warning, usually mid-session. And it would require
+the tool to hold your password. The webhook path has none of those properties:
+no credentials exist to leak, and it is a supported TradingView feature.
+
+**Security note.** The endpoint must be publicly reachable for TradingView to
+post to it, so anyone who finds the URL can post to it too. Always set a secret —
+a fake bar is a fake decision. It binds to `127.0.0.1` by default so it is never
+exposed by accident, and it refuses oversized bodies without reading them.
+
 ## Data sources
 
 | Source | Use | Notes |
 |---|---|---|
-| `--csv` | **Live trading** | Export 5-minute bars from Tradovate / NinjaTrader / TradingView. The reliable path. |
+| `--serve` | **Live trading** | TradingView alert webhooks — reads your actual chart. See above. |
+| `--csv` | Live trading, review | Export 5-minute bars from Tradovate / NinjaTrader / TradingView. |
 | `--live` | Learning, after-hours review | Delayed, rate-limits, revises bars. Not for funded decisions. |
 | `--demo` | Testing | Deterministic synthetic bars. Means nothing about real performance. |
 
@@ -363,6 +412,7 @@ src/nqcopilot/
 ├── playbook.py    Fuses signal + risk into one Directive (risk has veto)
 ├── backtest.py    Pessimistic bar-by-bar replay and metrics
 ├── calendar.py    Economic-calendar fetch for automatic news blackouts
+├── webhook.py     TradingView alert receiver (live feed from your chart)
 ├── data.py        CSV / live / demo loaders
 └── cli.py         The decision card
 pine/NQApexCopilot.pine

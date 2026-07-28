@@ -31,6 +31,7 @@ from .data import generate_demo_bars, load_csv
 from .market import IndicatorConfig, MarketContext, Regime
 from .playbook import Action, Directive, PlaybookConfig, evaluate
 from .signals import Setup, detect_all
+from .webhook import BarStore, WebhookConfig, WebhookContext, WebhookServer
 
 __version__ = "1.0.0"
 
@@ -41,6 +42,7 @@ __all__ = [
     "BacktestConfig",
     "BacktestResult",
     "Bar",
+    "BarStore",
     "Blocker",
     "CalendarError",
     "CompletedTrade",
@@ -61,6 +63,9 @@ __all__ = [
     "Session",
     "Setup",
     "Severity",
+    "WebhookConfig",
+    "WebhookContext",
+    "WebhookServer",
     "Sizing",
     "TrailingMode",
     "classify_session",
