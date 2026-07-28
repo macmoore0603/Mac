@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 348 tests. A hard rule gate always beats
+These are deterministic and covered by 361 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -382,10 +382,33 @@ Presets follow Apex's published intraday trailing-drawdown rules:
 Two things the presets deliberately do **not** guess:
 
 - **Tier-based limits.** A PA's contract cap and daily loss limit depend on
-  where you are in the scaling ladder. Pass `--max-contracts` and
-  `--firm-daily-loss` from your own tier. `--firm-daily-loss` is treated as a
-  firm rule that ends the account, distinct from `--daily-loss` which is your
-  own discipline.
+  where you are in the scaling ladder, and Apex's own tier table is behind a
+  bot wall I could not read — so it is not guessed here. Supply yours once:
+
+  ```bash
+  cat > tiers.json <<'JSON'
+  [{"balance": 50000, "contracts": 2, "daily_loss": 1000},
+   {"balance": 51000, "contracts": 4, "daily_loss": 1250},
+   {"balance": 52000, "contracts": 7, "daily_loss": 1500}]
+  JSON
+  nqcopilot --tiers tiers.json --state ~/.apex.json --csv nq_5m.csv
+  ```
+
+  (Those rows are a *shape example*, not Apex's numbers — replace them with
+  your dashboard's.) The ladder then tracks itself, including demotions after
+  a losing day. For a single fixed tier, `--max-contracts` and
+  `--firm-daily-loss` work instead. `--firm-daily-loss` is treated as a firm
+  rule that ends the account, distinct from `--daily-loss`, your own discipline.
+
+  **The trap it closes:** your tier comes from your *end-of-day* balance. Being
+  up $1,500 at noon does not entitle you to more contracts until the session
+  closes, and the copilot holds you to that:
+
+  ```
+  · Tier: 2 mini(s) / 20 micros, firm daily loss $1,000.00 — set by your
+    $50,000.00 closing balance. Intraday profit does not raise it until the
+    session ends.
+  ```
 - **The evaluation lock level.** Evaluations stop trailing at "starting balance
   plus an offset" whose value differs by platform. Left unset, which assumes the
   threshold never stops trailing — that understates your room rather than

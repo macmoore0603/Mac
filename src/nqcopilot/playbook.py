@@ -402,6 +402,14 @@ def _account_notes(state: AccountState) -> list[str]:
         f"Equity ${state.equity:,.2f} | threshold ${state.threshold:,.2f} | "
         f"room ${state.room:,.2f}",
     ]
+    tier = state.current_tier
+    if tier is not None:
+        notes.append(
+            f"Tier: {tier.max_contracts} mini(s) / {tier.max_contracts * 10} micros, "
+            f"firm daily loss ${tier.daily_loss_limit:,.2f} — set by your "
+            f"${state.tier_reference_balance:,.2f} closing balance. Intraday profit "
+            f"does not raise it until the session ends."
+        )
     to_lock = state.profit_to_lock_threshold()
     if to_lock is None:
         pass

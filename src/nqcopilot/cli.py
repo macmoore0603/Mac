@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .apex import (
     PRESETS,
+    ScalingLadder,
     AccountState,
     RiskEngine,
     RiskLimits,
@@ -96,6 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="apex50k-pa",
         choices=sorted(PRESETS),
         help="Account rule preset (default: apex50k-pa).",
+    )
+    account.add_argument(
+        "--tiers",
+        type=Path,
+        help="JSON scaling ladder: [{\"balance\":50000,\"contracts\":2,"
+        "\"daily_loss\":1000}, ...]. Supersedes --max-contracts and "
+        "--firm-daily-loss, and tracks tier changes from your end-of-day balance.",
     )
     account.add_argument(
         "--firm-daily-loss",
@@ -227,6 +235,15 @@ def load_state(args: argparse.Namespace) -> AccountState:
     profile = PRESETS[args.profile]
     # Tier-dependent limits are not knowable from the profile alone.
     overrides = {}
+    if getattr(args, "tiers", None) is not None:
+        try:
+            rows = json.loads(args.tiers.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DataError(f"cannot read {args.tiers}: {exc}") from exc
+        try:
+            overrides["scaling"] = ScalingLadder.from_rows(rows)
+        except (ValueError, TypeError) as exc:
+            raise DataError(f"{args.tiers}: {exc}") from exc
     if getattr(args, "firm_daily_loss", None) is not None:
         overrides["firm_daily_loss_limit"] = args.firm_daily_loss
     if getattr(args, "max_contracts", None) is not None:
@@ -271,6 +288,8 @@ def load_state(args: argparse.Namespace) -> AccountState:
     if stored_payout:
         state.last_payout_date = datetime.fromisoformat(stored_payout).date()
     state.payouts_taken = int(stored.get("payouts_taken", 0))
+    if stored.get("tier_reference_balance") is not None:
+        state.tier_reference_balance = float(stored["tier_reference_balance"])
     state.day_start_balance = float(stored.get("day_start_balance", state.closed_balance))
     state.trades_today = int(stored.get("trades_today", 0))
     state.consecutive_losses = int(stored.get("consecutive_losses", 0))
@@ -299,6 +318,7 @@ def save_state(path: Path, state: AccountState) -> None:
             state.last_payout_date.isoformat() if state.last_payout_date else None
         ),
         "payouts_taken": state.payouts_taken,
+        "tier_reference_balance": state.tier_reference_balance,
         "updated": datetime.now(ET).isoformat(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)

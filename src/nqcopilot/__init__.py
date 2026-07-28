@@ -25,6 +25,8 @@ from .apex import (
     TrailingMode,
     check_threshold_consistency,
     payout_status,
+    ScalingLadder,
+    ScalingTier,
 )
 from .backtest import BacktestConfig, BacktestResult, CompletedTrade, run_backtest
 from .bars import Bar, Session, classify_session, trading_date
@@ -71,6 +73,8 @@ __all__ = [
     "WebhookConfig",
     "WebhookContext",
     "WebhookServer",
+    "ScalingLadder",
+    "ScalingTier",
     "Sizing",
     "TrailingMode",
     "classify_session",

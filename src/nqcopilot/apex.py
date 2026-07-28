@@ -15,6 +15,7 @@ explicitly and surfaced in every decision (`room_cost_of_running_profit`).
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from enum import Enum
@@ -29,6 +30,73 @@ class TrailingMode(Enum):
     INTRADAY = "intraday"  # trails peak equity tick-by-tick, unrealised included
     END_OF_DAY = "eod"     # trails the closing balance only
     STATIC = "static"      # fixed floor, never moves
+
+
+@dataclass(frozen=True)
+class ScalingTier:
+    """One rung of a Performance Account's scaling ladder."""
+
+    min_balance: float       # end-of-day balance at or above this
+    max_contracts: int       # in minis
+    daily_loss_limit: float
+
+
+@dataclass(frozen=True)
+class ScalingLadder:
+    """Contract and daily-loss limits that move with the account balance.
+
+    Two properties of Apex's ladder matter and are modelled here:
+
+    * The tier is set from the **end-of-day** balance and applies to the *next*
+      session. Being up intraday does not raise today's contract allowance, and
+      assuming otherwise is a rule breach rather than an optimistic estimate.
+    * It moves **down** as well as up. A losing day can cut both your size and
+      your daily loss limit for the following session.
+
+    Thresholds are not bundled as a preset because they vary by account size and
+    change over time. Supply your own from your dashboard; `--tiers` loads them
+    from JSON.
+    """
+
+    tiers: tuple[ScalingTier, ...]
+
+    def __post_init__(self) -> None:
+        if not self.tiers:
+            raise ValueError("a ladder needs at least one tier")
+        ordered = sorted(self.tiers, key=lambda t: t.min_balance)
+        object.__setattr__(self, "tiers", tuple(ordered))
+
+    @classmethod
+    def from_rows(cls, rows: Sequence[dict]) -> "ScalingLadder":
+        """Build from `[{"balance": …, "contracts": …, "daily_loss": …}, …]`."""
+        tiers = []
+        for row in rows:
+            try:
+                tiers.append(
+                    ScalingTier(
+                        min_balance=float(row["balance"]),
+                        max_contracts=int(row["contracts"]),
+                        daily_loss_limit=float(row["daily_loss"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"bad scaling tier {row!r}: {exc}") from exc
+        return cls(tuple(tiers))
+
+    def for_balance(self, balance: float) -> ScalingTier:
+        """The tier a given end-of-day balance qualifies for.
+
+        Below the lowest rung the lowest rung still applies: an account under
+        its opening balance is not exempt from limits, it is simply at the
+        bottom of the ladder.
+        """
+        current = self.tiers[0]
+        for tier in self.tiers:
+            if balance >= tier.min_balance:
+                current = tier
+            else:
+                break
+        return current
 
 
 @dataclass(frozen=True)
@@ -59,6 +127,10 @@ class AccountProfile:
     # RiskLimits which merely protects you.
     firm_daily_loss_limit: float | None = None
 
+    # Optional scaling ladder. When present it supersedes max_contracts and
+    # firm_daily_loss_limit, derived from the end-of-day balance.
+    scaling: "ScalingLadder | None" = None
+
     # Payout rules. Zero/None disables the corresponding check.
     payout_min_days: int = 0            # qualifying trading days required
     payout_min_daily_profit: float = 0.0  # what makes a day "qualifying"
@@ -78,11 +150,24 @@ class AccountProfile:
         """
         return self.threshold_lock
 
-    def contract_cap(self, spec: ContractSpec) -> int:
-        """Maximum quantity of `spec` this account may hold."""
+    def contract_cap(self, spec: ContractSpec, tier_balance: float | None = None) -> int:
+        """Maximum quantity of `spec` this account may hold.
+
+        `tier_balance` is the end-of-day balance that set the current tier, not
+        the live balance — intraday profit does not raise today's allowance.
+        """
+        minis = self.max_contracts
+        if self.scaling is not None and tier_balance is not None:
+            minis = self.scaling.for_balance(tier_balance).max_contracts
         if is_micro(spec):
-            return self.max_contracts * MICROS_PER_MINI
-        return self.max_contracts
+            return minis * MICROS_PER_MINI
+        return minis
+
+    def daily_loss_limit_for(self, tier_balance: float | None = None) -> float | None:
+        """The firm's daily loss limit, from the ladder when one is configured."""
+        if self.scaling is not None and tier_balance is not None:
+            return self.scaling.for_balance(tier_balance).daily_loss_limit
+        return self.firm_daily_loss_limit
 
 
 # --------------------------------------------------------------------------
@@ -118,10 +203,10 @@ APEX_50K_PA = AccountProfile(
     payout_minimum=500.0,
     payout_lifetime_cap=6,
     verify_note=(
-        "Drawdown $2,000 (threshold starts $47,500... locks at $50,100 = start + $100). "
-        "Contract cap and daily loss limit are TIER-BASED — set --max-contracts and "
-        "--firm-daily-loss from your current tier. Minimum qualifying day ($50) "
-        "should be confirmed for your account size."
+        "Drawdown $2,000 (threshold starts $48,000, locks at $50,100 = start + $100). "
+        "Contract cap and daily loss limit are TIER-BASED and are NOT set here — "
+        "supply your ladder with --tiers, or a single tier with --max-contracts and "
+        "--firm-daily-loss. Confirm the $50 minimum qualifying day for your size."
     ),
 )
 
@@ -240,6 +325,9 @@ class AccountState:
     # measured since the last payout, so this window matters.
     last_payout_date: date | None = None
     payouts_taken: int = 0
+    # End-of-day balance that set today's tier. Deliberately NOT the live
+    # balance: intraday profit does not raise today's contract allowance.
+    tier_reference_balance: float | None = None
 
     @classmethod
     def fresh(cls, profile: AccountProfile, today: date | None = None) -> "AccountState":
@@ -251,6 +339,7 @@ class AccountState:
             threshold=profile.initial_threshold,
             session_date=today,
             day_start_balance=profile.starting_balance,
+            tier_reference_balance=profile.starting_balance,
         )
 
     @classmethod
@@ -279,6 +368,7 @@ class AccountState:
             session_date=today,
             day_start_balance=closed_balance,
             daily_pnl=dict(daily_pnl or {}),
+            tier_reference_balance=closed_balance,
         )
 
     # -- core arithmetic ---------------------------------------------------
@@ -349,11 +439,28 @@ class AccountState:
         if self.profile.trailing_mode is TrailingMode.END_OF_DAY:
             self.peak_equity = max(self.peak_equity, self.closed_balance)
             self._recompute_threshold()
+        # The tier for the next session is set by this session's closing
+        # balance — including downward moves after a losing day.
+        self.tier_reference_balance = self.closed_balance
         self.session_date = next_date
         self.day_start_balance = self.closed_balance
         self.trades_today = 0
         self.consecutive_losses = 0
         self.open_pnl = 0.0
+
+    @property
+    def current_tier(self) -> "ScalingTier | None":
+        """Today's tier, from the balance at the end of the previous session."""
+        ladder = self.profile.scaling
+        if ladder is None or self.tier_reference_balance is None:
+            return None
+        return ladder.for_balance(self.tier_reference_balance)
+
+    def contract_cap(self, spec: ContractSpec) -> int:
+        return self.profile.contract_cap(spec, self.tier_reference_balance)
+
+    def firm_daily_loss_limit(self) -> float | None:
+        return self.profile.daily_loss_limit_for(self.tier_reference_balance)
 
     def record_payout(self, amount: float, on_date: date | None = None) -> None:
         """Book a withdrawal, resetting the consistency and qualifying-day window.
@@ -549,7 +656,7 @@ class RiskEngine:
         # The firm's own daily loss limit ends the account, unlike the
         # self-imposed one below which merely ends the day. Checked first and
         # reported distinctly so the difference is never ambiguous.
-        firm_limit = s.profile.firm_daily_loss_limit
+        firm_limit = s.firm_daily_loss_limit()
         if firm_limit is not None and s.day_pnl <= -firm_limit:
             blockers.append(
                 Blocker(
@@ -623,7 +730,7 @@ class RiskEngine:
             ("threshold_buffer", room_budget),
             ("daily_loss_limit", daily_budget),
         ]
-        firm_limit = s.profile.firm_daily_loss_limit
+        firm_limit = s.firm_daily_loss_limit()
         if firm_limit is not None:
             candidates.append(
                 ("firm_daily_loss_limit", max(0.0, firm_limit + min(0.0, s.day_pnl)))
@@ -632,7 +739,7 @@ class RiskEngine:
 
         quantity = int(math.floor(risk_budget / risk_per_contract)) if risk_per_contract > 0 else 0
 
-        cap = s.profile.contract_cap(spec)
+        cap = s.contract_cap(spec)
         if lim.max_contracts_override is not None:
             override = lim.max_contracts_override
             if is_micro(spec):

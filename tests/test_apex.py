@@ -19,6 +19,7 @@ from nqcopilot.apex import (
     AccountState,
     RiskEngine,
     RiskLimits,
+    ScalingLadder,
     Severity,
     TrailingMode,
     payout_status,
@@ -553,3 +554,103 @@ class TestPayoutHistoryIntegrity:
         fresh_state.session_date = datetime(2026, 7, 20).date()
         fresh_state.close_trade(100.0)
         assert payout_status(fresh_state, today_profit=900.0).best_day == pytest.approx(900.0)
+
+
+class TestScalingLadder:
+    """Tier-based contract and daily-loss limits, derived from balance."""
+
+    LADDER = [
+        {"balance": 50_000, "contracts": 2, "daily_loss": 1_000},
+        {"balance": 51_000, "contracts": 4, "daily_loss": 1_250},
+        {"balance": 52_000, "contracts": 7, "daily_loss": 1_500},
+        {"balance": 53_000, "contracts": 10, "daily_loss": 2_000},
+    ]
+
+    def _profile(self):
+        from dataclasses import replace
+
+        return replace(APEX_50K_INTRADAY, scaling=ScalingLadder.from_rows(self.LADDER))
+
+    def test_tier_selected_by_balance(self):
+        ladder = ScalingLadder.from_rows(self.LADDER)
+        assert ladder.for_balance(50_500).max_contracts == 2
+        assert ladder.for_balance(51_000).max_contracts == 4
+        assert ladder.for_balance(52_999).max_contracts == 7
+        assert ladder.for_balance(99_999).max_contracts == 10
+
+    def test_below_the_lowest_rung_still_has_limits(self):
+        """An account under its opening balance is at the bottom, not exempt."""
+        ladder = ScalingLadder.from_rows(self.LADDER)
+        assert ladder.for_balance(48_500).max_contracts == 2
+        assert ladder.for_balance(48_500).daily_loss_limit == 1_000
+
+    def test_rows_are_sorted_regardless_of_input_order(self):
+        ladder = ScalingLadder.from_rows(list(reversed(self.LADDER)))
+        assert [t.max_contracts for t in ladder.tiers] == [2, 4, 7, 10]
+
+    def test_empty_ladder_is_rejected(self):
+        with pytest.raises(ValueError, match="at least one tier"):
+            ScalingLadder(())
+
+    def test_malformed_row_is_rejected(self):
+        with pytest.raises(ValueError, match="bad scaling tier"):
+            ScalingLadder.from_rows([{"balance": 1, "contracts": "many"}])
+
+    def test_intraday_profit_does_not_raise_todays_allowance(self):
+        """The trap: the tier comes from yesterday's close, not today's equity."""
+        state = AccountState.fresh(self._profile())
+        assert state.contract_cap(MNQ) == 20  # 2 minis
+
+        state.close_trade(1_500.0)   # balance now 51,500, would be tier 2
+        assert state.contract_cap(MNQ) == 20  # still today's tier
+
+        state.end_session(datetime(2026, 7, 28).date())
+        assert state.contract_cap(MNQ) == 40  # 4 minis, from tomorrow
+
+    def test_a_losing_day_demotes_the_tier(self):
+        state = AccountState.fresh(self._profile())
+        state.close_trade(2_500.0)
+        state.end_session(datetime(2026, 7, 28).date())
+        assert state.contract_cap(MNQ) == 70   # 52,500 -> 7 minis
+
+        state.close_trade(-1_000.0)            # back to 51,500
+        state.end_session(datetime(2026, 7, 29).date())
+        assert state.contract_cap(MNQ) == 40   # demoted to 4 minis
+
+    def test_daily_loss_limit_moves_with_the_tier(self):
+        state = AccountState.fresh(self._profile())
+        assert state.firm_daily_loss_limit() == pytest.approx(1_000.0)
+        state.close_trade(3_200.0)
+        state.end_session(datetime(2026, 7, 28).date())
+        assert state.firm_daily_loss_limit() == pytest.approx(2_000.0)
+
+    def test_tier_daily_loss_limit_is_enforced(self, rth_open):
+        state = AccountState.fresh(self._profile())
+        state.close_trade(-1_000.0)   # exactly the tier-1 limit
+        codes = {
+            b.code
+            for b in RiskEngine(state, RiskLimits(daily_loss_limit=99_000.0)).check(rth_open)
+        }
+        assert "firm_daily_loss_limit" in codes
+
+    def test_tier_caps_position_size(self):
+        state = AccountState.fresh(self._profile())
+        engine = RiskEngine(
+            state,
+            RiskLimits(
+                max_risk_per_trade=100_000.0,
+                max_risk_pct_of_room=10.0,
+                daily_loss_limit=100_000.0,
+            ),
+        )
+        assert engine.size_position(MNQ, 8.0).quantity == 20  # 2 minis of micros
+
+    def test_current_tier_is_reported(self):
+        state = AccountState.fresh(self._profile())
+        assert state.current_tier.max_contracts == 2
+        assert AccountState.fresh(APEX_50K_INTRADAY).current_tier is None
+
+    def test_no_ladder_falls_back_to_the_flat_cap(self):
+        state = AccountState.fresh(APEX_50K_INTRADAY)
+        assert state.contract_cap(MNQ) == 100  # 10 minis
+        assert state.firm_daily_loss_limit() is None
