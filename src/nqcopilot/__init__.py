@@ -23,6 +23,7 @@ from .apex import (
     TrailingMode,
     consistency_status,
 )
+from .backtest import BacktestConfig, BacktestResult, CompletedTrade, run_backtest
 from .bars import Bar, Session, classify_session, trading_date
 from .contracts import ES, MES, MNQ, NQ, ContractSpec, get_contract
 from .data import generate_demo_bars, load_csv
@@ -36,8 +37,11 @@ __all__ = [
     "Action",
     "AccountProfile",
     "AccountState",
+    "BacktestConfig",
+    "BacktestResult",
     "Bar",
     "Blocker",
+    "CompletedTrade",
     "ContractSpec",
     "Directive",
     "ES",
@@ -63,6 +67,7 @@ __all__ = [
     "generate_demo_bars",
     "get_contract",
     "load_csv",
+    "run_backtest",
     "trading_date",
     "__version__",
 ]

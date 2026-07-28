@@ -22,6 +22,7 @@ from .apex import (
     RiskLimits,
     TrailingMode,
 )
+from .backtest import BacktestConfig, format_report, run_backtest
 from .bars import ET, Bar, classify_session, validate_series
 from .contracts import get_contract
 from .data import DataError, fetch_live, generate_demo_bars, load_csv
@@ -122,6 +123,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="HH:MM",
         help="Blackout around a release, ET. Repeatable.",
+    )
+
+    replay = parser.add_argument_group("replay")
+    replay.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Replay the copilot over the loaded bars instead of reading the last one.",
+    )
+    replay.add_argument(
+        "--slippage-ticks",
+        type=float,
+        default=1.0,
+        help="Adverse slippage applied to entries and stops (default: 1 tick).",
+    )
+    replay.add_argument(
+        "--trades", action="store_true", help="List every trade from the replay."
     )
 
     output = parser.add_argument_group("output")
@@ -404,6 +421,74 @@ def directive_to_dict(directive: Directive, state: AccountState) -> dict:
     }
 
 
+def run_replay(
+    args: argparse.Namespace,
+    spec,
+    state: AccountState,
+    bars: list[Bar],
+    engine: RiskEngine,
+    c: Palette,
+) -> int:
+    """Replay the copilot over the loaded bars and print a summary."""
+    result = run_backtest(
+        bars,
+        spec,
+        state,
+        limits=engine.limits,
+        playbook=PlaybookConfig(min_score=args.min_score),
+        config=BacktestConfig(slippage_ticks=args.slippage_ticks),
+    )
+
+    if args.json:
+        metrics = result.metrics
+        print(
+            json.dumps(
+                {
+                    "metrics": asdict(metrics),
+                    "breached": result.breached,
+                    "breach_ts": result.breach_ts.isoformat() if result.breach_ts else None,
+                    "final_balance": result.state.closed_balance,
+                    "final_threshold": result.state.threshold,
+                    "trades": [
+                        {
+                            "setup": t.setup_name,
+                            "side": t.side,
+                            "quantity": t.quantity,
+                            "entry_ts": t.entry_ts.isoformat(),
+                            "entry": t.entry_price,
+                            "exit_ts": t.exit_ts.isoformat(),
+                            "exit": t.exit_price,
+                            "net_pnl": t.net_pnl,
+                            "r": t.r_multiple,
+                            "reason": t.exit_reason,
+                        }
+                        for t in result.trades
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(format_report(result, spec))
+
+    if args.trades and result.trades:
+        print("\n Trades")
+        print(
+            f"   {'Entry':<17}{'Setup':<26}{'Side':<7}{'Qty':>4}"
+            f"{'Net':>11}{'R':>7}  Exit"
+        )
+        for t in result.trades:
+            colour = GREEN if t.net_pnl > 0 else RED
+            print(
+                f"   {t.entry_ts:%m-%d %H:%M}    {t.setup_name:<26}{t.side:<7}{t.quantity:>4}"
+                + c(f"{t.net_pnl:>11,.2f}", colour)
+                + f"{t.r_multiple:>7.2f}  {t.exit_reason}"
+            )
+
+    return 0
+
+
 def run_once(args: argparse.Namespace, c: Palette) -> int:
     spec = get_contract(args.symbol)
     if args.round_turn is not None:
@@ -418,6 +503,9 @@ def run_once(args: argparse.Namespace, c: Palette) -> int:
     state = load_state(args)
     bars = load_bars(args)
     engine = build_risk(args, state)
+
+    if args.backtest:
+        return run_replay(args, spec, state, bars, engine, c)
 
     directive = evaluate(
         bars,

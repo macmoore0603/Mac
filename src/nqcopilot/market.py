@@ -9,7 +9,7 @@ backtested well falls apart live.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import time
 from enum import Enum
 
@@ -114,7 +114,25 @@ class MarketContext:
     pivots: Pivots
     prior_day: PriorDayLevels
     ema_mid_slope: Series
-    htf_bias: int  # +1 bullish, -1 bearish, 0 neutral
+    # Higher-timeframe trend at every bar: +1 bullish, -1 bearish, 0 neutral.
+    # Stored as a series so a whole run can share one context (see `at_index`).
+    htf_bias_series: list[int]
+
+    @property
+    def htf_bias(self) -> int:
+        return self.htf_bias_series[self.index]
+
+    def at_index(self, index: int) -> "MarketContext":
+        """A view of this context at another bar, sharing the computed series.
+
+        Rebuilding the indicator stack per bar is O(n^2) and makes replaying a
+        few months of 5-minute data impractical. Every series here is already
+        causal, so moving the evaluation index is sufficient and cannot leak
+        future information.
+        """
+        if not 0 <= index < len(self.bars):
+            raise IndexError(f"index {index} out of range for {len(self.bars)} bars")
+        return replace(self, index=index)
 
     @classmethod
     def build(
@@ -153,7 +171,7 @@ class MarketContext:
             pivots=swing_pivots(bars, cfg.pivot_left, cfg.pivot_right),
             prior_day=prior_day_levels(bars),
             ema_mid_slope=slope_per_bar(ema_mid_series, cfg.slope_window),
-            htf_bias=_higher_timeframe_bias(bars[: idx + 1], cfg),
+            htf_bias_series=_htf_bias_series(bars, cfg),
         )
 
     # -- convenience accessors at the evaluation index ---------------------
@@ -300,24 +318,82 @@ class MarketContext:
         return self.bar.volume / avg
 
 
-def _higher_timeframe_bias(bars: list[Bar], cfg: IndicatorConfig) -> int:
-    """Trend direction on the higher timeframe, from closed HTF bars only.
+class _StreamingEMA:
+    """EMA maintained incrementally, seeded with an SMA like `indicators.ema`."""
+
+    def __init__(self, length: int) -> None:
+        self.length = length
+        self._k = 2.0 / (length + 1.0)
+        self._seed: list[float] = []
+        self.value: float | None = None
+
+    def update(self, x: float) -> float | None:
+        if self.value is None:
+            self._seed.append(x)
+            if len(self._seed) == self.length:
+                self.value = sum(self._seed) / self.length
+        else:
+            self.value = x * self._k + self.value * (1.0 - self._k)
+        return self.value
+
+
+def _htf_bias_series(bars: list[Bar], cfg: IndicatorConfig) -> list[int]:
+    """Higher-timeframe trend direction at every bar, from closed HTF bars only.
 
     Trading against the 15-minute trend on a 5-minute signal is a recognisable
-    way to lose slowly, so this is used as a scoring input for every setup.
+    way to lose slowly, so this feeds the score of every setup.
+
+    A higher-timeframe bar only becomes visible once the next one starts, so the
+    bias at bar `i` reflects buckets that had genuinely finished by then. Built
+    in a single streaming pass to keep whole-series construction linear.
     """
-    htf = resample(bars, cfg.htf_minutes)
-    if len(htf) < cfg.htf_ema + 1:
-        return 0
-    closes = [b.close for b in htf]
-    series = ema(closes, cfg.htf_ema)
-    value = series[-1]
-    if value is None:
-        return 0
-    last_close = closes[-1]
-    slope = slope_per_bar(series, min(5, len(series)))[-1]
-    if last_close > value and (slope is None or slope >= 0):
+    n = len(bars)
+    out = [0] * n
+    if n == 0:
+        return out
+
+    trend_ema = _StreamingEMA(cfg.htf_ema)
+    recent: list[float] = []       # trailing EMA values, for the slope check
+    bias = 0
+    bucket_key: tuple | None = None
+    bucket_last_close: float | None = None
+
+    for i, bar in enumerate(bars):
+        et = bar.et
+        key = (et.date(), (et.hour * 60 + et.minute) // cfg.htf_minutes)
+
+        if bucket_key is None:
+            bucket_key = key
+        elif key != bucket_key:
+            # The previous bucket has closed and may now be acted upon.
+            value = trend_ema.update(bucket_last_close)
+            if value is not None:
+                recent.append(value)
+                if len(recent) > 5:
+                    recent.pop(0)
+                bias = _bias_from(bucket_last_close, value, recent)
+            bucket_key = key
+
+        bucket_last_close = bar.close
+        out[i] = bias
+
+    return out
+
+
+def _bias_from(last_close: float, ema_value: float, recent: list[float]) -> int:
+    """Direction from price vs its EMA, requiring the EMA slope to agree."""
+    slope = None
+    if len(recent) >= 2:
+        length = len(recent)
+        xs = list(range(length))
+        x_mean = sum(xs) / length
+        y_mean = sum(recent) / length
+        x_var = sum((x - x_mean) ** 2 for x in xs)
+        if x_var:
+            slope = sum((xs[j] - x_mean) * (recent[j] - y_mean) for j in range(length)) / x_var
+
+    if last_close > ema_value and (slope is None or slope >= 0):
         return 1
-    if last_close < value and (slope is None or slope <= 0):
+    if last_close < ema_value and (slope is None or slope <= 0):
         return -1
     return 0

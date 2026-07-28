@@ -105,9 +105,29 @@ def evaluate(
             from "should I enter" to "should I stay".
         now: Decision time; defaults to the last bar's timestamp.
     """
+    ctx = MarketContext.build(bars, spec, indicators)
+    return evaluate_context(
+        ctx, state, risk=risk, config=config, in_position=in_position, now=now
+    )
+
+
+def evaluate_context(
+    ctx: MarketContext,
+    state: AccountState,
+    *,
+    risk: RiskEngine | None = None,
+    config: PlaybookConfig | None = None,
+    in_position: bool = False,
+    now: datetime | None = None,
+) -> Directive:
+    """Produce the instruction for a prebuilt context at its evaluation index.
+
+    Separated from `evaluate` so a replay can build the indicator stack once and
+    step the index, rather than recomputing every series on every bar.
+    """
     cfg = config or PlaybookConfig()
     engine = risk or RiskEngine(state)
-    ctx = MarketContext.build(bars, spec, indicators)
+    spec = ctx.spec
     decision_time = now or ctx.bar.ts
     regime = ctx.regime()
 

@@ -238,10 +238,50 @@ my_account = replace(APEX_50K_INTRADAY, drawdown_amount=2_000.0, threshold_lock=
 
 ---
 
+## Replay / backtest
+
+```bash
+nqcopilot --csv nq_5m_2024.csv --symbol MNQ --backtest --trades
+```
+
+Replays the copilot bar by bar, evolving the account exactly as it would live —
+the threshold trails, daily counters roll, and entries are gated by the state as
+it stood at that moment. It tests the whole system, not just the signal layer.
+
+**Every modelling choice is the pessimistic one**, because a harness that
+flatters the strategy is worse than none:
+
+| Choice | Why |
+|---|---|
+| Entry fills on the **next bar's open**, plus slippage | The signal bar's close has already happened and can't be traded. Filling at it is the most common way a backtest invents profit. |
+| Ambiguous bars resolve **as losses** | When one bar's range holds both the stop and a target, there's no honest way to know which came first without tick data. |
+| Gaps fill **at the open** | Not at the stop price. |
+| Threshold ratchets on each bar's **favourable extreme** | The most punishing reading of the intraday rule. |
+| Commission on **every** exit | Including partial scale-outs. |
+| Time stop at 24 bars | A momentum thesis that hasn't resolved in two hours has expired. |
+
+A worked example of why this matters — a run that finished **up $66 net**:
+
+```
+ Account   balance $50,066.62  threshold $47,891.64  room $2,174.98
+```
+
+Up sixty-six dollars, and $325 of drawdown room gone. That is the ratchet, and
+it is why the risk layer exists.
+
+**On `--demo` data the strategy loses slightly.** That is the correct result and
+a good sign: synthetic bars are a random walk with no edge to find, so anything
+showing a profit there would mean the harness is cheating. Real expectancy needs
+real bars.
+
+What it still cannot model: true slippage on a fast tape, partial fills, order
+rejects, or whether your platform was connected. Treat any output as an upper
+bound on quality, never as an expectation.
+
 ## Testing
 
 ```bash
-python3 -m pytest -q     # 153 tests
+python3 -m pytest -q     # 174 tests
 ```
 
 The suite covers the threshold ratchet and its monotonicity under random mark
@@ -258,9 +298,9 @@ easy to get quietly wrong:
 
 ## Limitations
 
-- **Not a backtester.** There is no historical performance claim here, because I
-  have not run one on real data. Any equity curve produced from `--demo` is
-  synthetic and means nothing.
+- **No performance claim.** The replay harness exists, but I have not run it on
+  real market data, so there is no expectancy figure here worth trusting. Any
+  equity curve from `--demo` is synthetic and means nothing.
 - **Parameters are conventional, not optimised.** Tuning them to a historical
   window is the classic route to something that looks superb in backtest and is
   worthless forward.
@@ -286,6 +326,7 @@ src/nqcopilot/
 ├── signals.py     The five setup detectors
 ├── apex.py        Trailing threshold, sizing, rule gates, consistency rule
 ├── playbook.py    Fuses signal + risk into one Directive (risk has veto)
+├── backtest.py    Pessimistic bar-by-bar replay and metrics
 ├── data.py        CSV / live / demo loaders
 └── cli.py         The decision card
 pine/NQApexCopilot.pine
