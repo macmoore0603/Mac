@@ -135,6 +135,41 @@ why is training you to click without thinking.
 
 ---
 
+## Data sources
+
+| Source | Use | Notes |
+|---|---|---|
+| `--csv` | **Live trading** | Export 5-minute bars from Tradovate / NinjaTrader / TradingView. The reliable path. |
+| `--live` | Learning, after-hours review | Delayed, rate-limits, revises bars. Not for funded decisions. |
+| `--demo` | Testing | Deterministic synthetic bars. Means nothing about real performance. |
+
+To wire your broker feed in, produce a `list[Bar]` — that is the entire
+interface, and everything downstream works unchanged.
+
+### Economic calendar (optional)
+
+`--news-auto` fetches the day's high-impact releases and blacks out entries
+around them, replacing hand-typed `--news 08:30` flags. Backed by the RapidAPI
+[Trading View API](https://rapidapi.com/apidojo/api/trading-view) (apidojo):
+
+```bash
+export RAPIDAPI_KEY=your-key
+nqcopilot --csv nq_5m.csv --news-auto --news-countries US
+```
+
+**That API cannot supply price bars.** Its 14 endpoints are auto-complete,
+calendars, ideas, news, movers and financials — there is no OHLC/candlestick
+endpoint, so it can't replace `--csv` or `--live`. Its economic calendar is
+genuinely useful though, which is the part wired up here.
+
+If the fetch fails, the copilot warns **loudly on stderr** and still produces a
+read. It never drops a safety gate silently:
+
+```
+! news calendar unavailable (...). Blackout windows are NOT active —
+  check the schedule yourself before trading.
+```
+
 ## Daily workflow
 
 ```bash
@@ -171,7 +206,7 @@ working from stale numbers and its guarantees no longer hold.
 | CME halt | 17:00–18:00 ET | Market closed |
 | Opening auction | first 5 min | Spreads wide, range undefined |
 | Lunch | 11:30–13:30 ET | Poor follow-through (soft warning) |
-| News blackout | ±15 min | Opt in with `--news 08:30` |
+| News blackout | ±15 min | `--news 08:30`, or `--news-auto` to fetch the schedule |
 
 Position size is the **minimum** of every applicable constraint, and the card
 names which one bound. Commission is inside every risk figure — on micros with a
@@ -327,6 +362,7 @@ src/nqcopilot/
 ├── apex.py        Trailing threshold, sizing, rule gates, consistency rule
 ├── playbook.py    Fuses signal + risk into one Directive (risk has veto)
 ├── backtest.py    Pessimistic bar-by-bar replay and metrics
+├── calendar.py    Economic-calendar fetch for automatic news blackouts
 ├── data.py        CSV / live / demo loaders
 └── cli.py         The decision card
 pine/NQApexCopilot.pine

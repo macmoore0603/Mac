@@ -25,6 +25,7 @@ from .apex import (
 )
 from .backtest import BacktestConfig, BacktestResult, CompletedTrade, run_backtest
 from .bars import Bar, Session, classify_session, trading_date
+from .calendar import CalendarError, EconomicEvent, fetch_economic_calendar
 from .contracts import ES, MES, MNQ, NQ, ContractSpec, get_contract
 from .data import generate_demo_bars, load_csv
 from .market import IndicatorConfig, MarketContext, Regime
@@ -41,8 +42,10 @@ __all__ = [
     "BacktestResult",
     "Bar",
     "Blocker",
+    "CalendarError",
     "CompletedTrade",
     "ContractSpec",
+    "EconomicEvent",
     "Directive",
     "ES",
     "IndicatorConfig",
@@ -64,6 +67,7 @@ __all__ = [
     "consistency_status",
     "detect_all",
     "evaluate",
+    "fetch_economic_calendar",
     "generate_demo_bars",
     "get_contract",
     "load_csv",

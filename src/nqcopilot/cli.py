@@ -24,6 +24,7 @@ from .apex import (
 )
 from .backtest import BacktestConfig, format_report, run_backtest
 from .bars import ET, Bar, classify_session, validate_series
+from .calendar import CalendarError, EconomicEvent, fetch_economic_calendar
 from .contracts import get_contract
 from .data import DataError, fetch_live, generate_demo_bars, load_csv
 from .market import IndicatorConfig
@@ -123,6 +124,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="HH:MM",
         help="Blackout around a release, ET. Repeatable.",
+    )
+    risk.add_argument(
+        "--news-auto",
+        action="store_true",
+        help="Fetch today's high-impact releases and blackout around them. "
+        "Needs RAPIDAPI_KEY (RapidAPI 'Trading View' by apidojo).",
+    )
+    risk.add_argument(
+        "--news-countries",
+        default="US",
+        help="Country codes for --news-auto (default: US).",
+    )
+    risk.add_argument(
+        "--news-importance",
+        type=int,
+        default=1,
+        choices=[-1, 0, 1],
+        help="Minimum importance for --news-auto: -1 low, 0 medium, 1 high (default: 1).",
     )
 
     replay = parser.add_argument_group("replay")
@@ -228,7 +247,51 @@ def save_state(path: Path, state: AccountState) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
-def build_risk(args: argparse.Namespace, state: AccountState) -> RiskEngine:
+def collect_news(
+    args: argparse.Namespace,
+) -> tuple[list[datetime], list[EconomicEvent], str | None]:
+    """Assemble blackout times from manual flags and, optionally, the calendar.
+
+    Returns (times, events, warning). A calendar fetch that fails yields a
+    warning rather than an exception: the blackout is a refinement, and refusing
+    to produce any read because an HTTP call timed out helps nobody. The warning
+    is deliberately loud — a silently missing gate is the dangerous outcome.
+    """
+    today = datetime.now(ET).date()
+    times: list[datetime] = []
+    for raw in args.news:
+        try:
+            hh, mm = (int(p) for p in raw.split(":"))
+            times.append(
+                datetime.combine(
+                    today, datetime.min.time().replace(hour=hh, minute=mm), tzinfo=ET
+                )
+            )
+        except (ValueError, TypeError) as exc:
+            raise DataError(f"bad --news value {raw!r}, expected HH:MM") from exc
+
+    events: list[EconomicEvent] = []
+    warning: str | None = None
+    if args.news_auto:
+        try:
+            events = fetch_economic_calendar(
+                day=today,
+                countries=args.news_countries,
+                min_importance=args.news_importance,
+            )
+            times.extend(event.ts for event in events)
+        except CalendarError as exc:
+            warning = (
+                f"news calendar unavailable ({exc}). Blackout windows are NOT "
+                f"active — check the schedule yourself before trading."
+            )
+
+    return times, events, warning
+
+
+def build_risk(
+    args: argparse.Namespace, state: AccountState, news_times: list[datetime] | None = None
+) -> RiskEngine:
     limits = RiskLimits(
         max_risk_per_trade=args.risk_per_trade,
         daily_loss_limit=args.daily_loss,
@@ -237,15 +300,7 @@ def build_risk(args: argparse.Namespace, state: AccountState) -> RiskEngine:
         max_contracts_override=args.max_contracts,
         block_lunch=not args.allow_lunch,
     )
-    today = datetime.now(ET).date()
-    news: list[datetime] = []
-    for raw in args.news:
-        try:
-            hh, mm = (int(p) for p in raw.split(":"))
-            news.append(datetime.combine(today, datetime.min.time().replace(hour=hh, minute=mm), tzinfo=ET))
-        except (ValueError, TypeError) as exc:
-            raise DataError(f"bad --news value {raw!r}, expected HH:MM") from exc
-    return RiskEngine(state, limits, news)
+    return RiskEngine(state, limits, news_times or [])
 
 
 # --------------------------------------------------------------------------
@@ -421,7 +476,7 @@ def directive_to_dict(directive: Directive, state: AccountState) -> dict:
     }
 
 
-def run_replay(
+def run_replay(  # noqa: PLR0913 - mirrors run_once's dependencies
     args: argparse.Namespace,
     spec,
     state: AccountState,
@@ -502,7 +557,11 @@ def run_once(args: argparse.Namespace, c: Palette) -> int:
 
     state = load_state(args)
     bars = load_bars(args)
-    engine = build_risk(args, state)
+    news_times, events, news_warning = collect_news(args)
+    engine = build_risk(args, state, news_times)
+
+    if news_warning:
+        print(c(f"  ! {news_warning}", YELLOW, BOLD), file=sys.stderr)
 
     if args.backtest:
         return run_replay(args, spec, state, bars, engine, c)
@@ -521,6 +580,12 @@ def run_once(args: argparse.Namespace, c: Palette) -> int:
         print(json.dumps(directive_to_dict(directive, state), indent=2))
     else:
         print(render(directive, state, spec, c, args.verbose))
+        if events:
+            print(c("\n  SCHEDULED RELEASES TODAY", BOLD))
+            now = datetime.now(ET)
+            for event in events:
+                marker = "·" if event.ts < now else "→"
+                print(f"    {marker} {event}")
         if state.profile.verify_note:
             print(c(f"\n  Rule assumptions — {state.profile.verify_note}", DIM))
 
