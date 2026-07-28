@@ -23,11 +23,17 @@ indicator("NQ Apex Copilot", shorttitle="NQ COPILOT", overlay = true, max_labels
 // ---------------------------------------------------------------- inputs ----
 grpAcct = "Account (copy from your Apex dashboard)"
 inBalance    = input.float(50000.0, "Account balance ($)",        group = grpAcct, step = 100)
-inThreshold  = input.float(47500.0, "Trailing threshold ($)",     group = grpAcct, step = 100,
-     tooltip = "The live threshold Apex shows you — NOT balance minus drawdown, once it has trailed.")
+inThreshold  = input.float(48000.0, "Trailing threshold ($)",     group = grpAcct, step = 100,
+     tooltip = "The live threshold Apex shows you — NOT balance minus drawdown, once it has trailed. " +
+     "A $50K starts at $48,000 ($2,000 drawdown).")
 inLock       = input.float(50100.0, "Threshold lock level ($)",   group = grpAcct, step = 100,
-     tooltip = "Level at which the threshold stops trailing. Verify against your account type.")
-inMaxCon     = input.int(10,        "Max contracts (minis)",      group = grpAcct, minval = 1)
+     tooltip = "Starting balance + $100, where the threshold stops trailing permanently. " +
+     "This is also the safety net: only profit above it is withdrawable.")
+inMaxCon     = input.int(10,        "Max contracts (minis)",      group = grpAcct, minval = 1,
+     tooltip = "PA contract limits are tier-based. Set this from your current tier.")
+inFirmDaily  = input.float(0.0,     "Firm daily loss limit ($)",  group = grpAcct, step = 50,
+     tooltip = "Your PA tier's daily loss limit. 0 disables (evaluations enforce none). " +
+     "This is a firm rule that ends the account, unlike the self-imposed limit below.")
 
 grpRisk = "Risk limits (self-imposed — Apex sets almost none)"
 inRiskTrade  = input.float(250.0, "Max risk per trade ($)",       group = grpRisk, step = 25)
@@ -264,8 +270,11 @@ threshold       = math.min(inThreshold, inLock)
 room            = equity - threshold
 riskPerContract = na(stopPts) ? na : stopPts * pointValue + inRoundTurn
 
+// The tightest constraint decides size. A firm daily loss limit, when set,
+// binds alongside the self-imposed one.
+dailyBudget = inFirmDaily > 0 ? math.min(inDailyLoss, inFirmDaily) : inDailyLoss
 budget = math.min(inRiskTrade, math.min(room * inPctRoom / 100.0,
-     math.min(math.max(0, room - inBuffer), inDailyLoss)))
+     math.min(math.max(0, room - inBuffer), dailyBudget)))
 qtyRaw = na(riskPerContract) or riskPerContract <= 0 ? 0 : math.floor(budget / riskPerContract)
 qty    = math.max(0, math.min(qtyRaw, contractCap))
 

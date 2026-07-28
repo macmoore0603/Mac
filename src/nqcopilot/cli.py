@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import time as _time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +22,8 @@ from .apex import (
     RiskEngine,
     RiskLimits,
     TrailingMode,
+    check_threshold_consistency,
+    payout_status,
 )
 from .backtest import BacktestConfig, format_report, run_backtest
 from .bars import ET, Bar, classify_session, validate_series
@@ -91,9 +93,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     account.add_argument(
         "--profile",
-        default="apex50k-intraday",
+        default="apex50k-pa",
         choices=sorted(PRESETS),
-        help="Account rule preset (default: apex50k-intraday).",
+        help="Account rule preset (default: apex50k-pa).",
+    )
+    account.add_argument(
+        "--firm-daily-loss",
+        type=float,
+        help="Your PA tier's daily loss limit. This is a firm rule that ends the "
+        "account, unlike --daily-loss which is your own discipline.",
+    )
+    account.add_argument(
+        "--record-payout",
+        type=float,
+        metavar="AMOUNT",
+        help="Book a withdrawal into --state and exit. Resets the consistency window.",
     )
     account.add_argument("--balance", type=float, help="Current closed balance.")
     account.add_argument("--threshold", type=float, help="Current trailing threshold.")
@@ -211,6 +225,14 @@ def load_bars(args: argparse.Namespace) -> list[Bar]:
 def load_state(args: argparse.Namespace) -> AccountState:
     """Build account state from --state, explicit flags, or the profile defaults."""
     profile = PRESETS[args.profile]
+    # Tier-dependent limits are not knowable from the profile alone.
+    overrides = {}
+    if getattr(args, "firm_daily_loss", None) is not None:
+        overrides["firm_daily_loss_limit"] = args.firm_daily_loss
+    if getattr(args, "max_contracts", None) is not None:
+        overrides["max_contracts"] = args.max_contracts
+    if overrides:
+        profile = replace(profile, **overrides)
     today = datetime.now(ET).date()
 
     stored: dict = {}
@@ -232,6 +254,12 @@ def load_state(args: argparse.Namespace) -> AccountState:
         for k, v in (stored.get("daily_pnl") or {}).items()
     }
 
+    warning = check_threshold_consistency(profile, float(balance), float(threshold))
+    if warning:
+        # A threshold the drawdown cannot produce almost always means the wrong
+        # profile is selected, which would report room the account lacks.
+        print(f"  ! Account numbers disagree: {warning}", file=sys.stderr)
+
     state = AccountState.resume(
         profile,
         closed_balance=float(balance),
@@ -239,6 +267,10 @@ def load_state(args: argparse.Namespace) -> AccountState:
         today=today,
         daily_pnl=daily,
     )
+    stored_payout = stored.get("last_payout_date")
+    if stored_payout:
+        state.last_payout_date = datetime.fromisoformat(stored_payout).date()
+    state.payouts_taken = int(stored.get("payouts_taken", 0))
     state.day_start_balance = float(stored.get("day_start_balance", state.closed_balance))
     state.trades_today = int(stored.get("trades_today", 0))
     state.consecutive_losses = int(stored.get("consecutive_losses", 0))
@@ -263,6 +295,10 @@ def save_state(path: Path, state: AccountState) -> None:
         "consecutive_losses": state.consecutive_losses,
         "session_date": state.session_date.isoformat() if state.session_date else None,
         "daily_pnl": {k.isoformat(): v for k, v in state.daily_pnl.items()},
+        "last_payout_date": (
+            state.last_payout_date.isoformat() if state.last_payout_date else None
+        ),
+        "payouts_taken": state.payouts_taken,
         "updated": datetime.now(ET).isoformat(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -421,15 +457,21 @@ def render(directive: Directive, state: AccountState, spec, c: Palette, verbose:
                 out.append(f"    {'·' if j == 0 else ' '} {line}")
         out.append("")
 
-    if directive.consistency and directive.consistency.required_total:
+    payout = directive.consistency
+    if payout is not None and (payout.required_total or payout.required_days):
         out.append(c("  PAYOUT", BOLD))
-        for line in _wrap(directive.consistency.message, indent=6):
+        for line in _wrap(payout.message, indent=6):
             out.append(f"      {line}")
-        extra = directive.consistency.max_additional_today
+        out.append(
+            f"      Days {payout.qualifying_days}/{payout.required_days}  "
+            f"withdrawable ${payout.withdrawable:,.2f}  "
+            f"best day ${payout.best_day:,.2f} of ${payout.total_profit:,.2f}"
+        )
+        extra = payout.max_additional_today
         if extra is not None and extra > 0:
             for line in _wrap(
-                f"Banking more than ${extra:,.2f} further today raises the total profit "
-                f"needed before you can withdraw.",
+                f"Banking more than ${extra:,.2f} further today would make today "
+                f"too large a share of the total and delay your payout.",
                 indent=6,
             ):
                 out.append(c(f"      {line}", DIM))
@@ -721,6 +763,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"Recorded {verb} of ${abs(args.record_trade):,.2f}. "
                 f"Balance ${state.closed_balance:,.2f}, threshold ${state.threshold:,.2f}, "
                 f"room ${state.room:,.2f}, {state.trades_today} trade(s) today."
+            )
+            return 0
+
+        if args.record_payout is not None:
+            if not args.state:
+                parser.error("--record-payout requires --state")
+            state = load_state(args)
+            status = payout_status(state)
+            if not status.eligible:
+                print(c(f"  ! {status.message}", YELLOW), file=sys.stderr)
+            state.record_payout(args.record_payout)
+            save_state(args.state, state)
+            print(
+                f"Recorded payout of ${args.record_payout:,.2f}. "
+                f"Balance ${state.closed_balance:,.2f}, threshold "
+                f"${state.threshold:,.2f}, room ${state.room:,.2f}. "
+                f"Payout {state.payouts_taken}"
+                + (f" of {state.profile.payout_lifetime_cap}" if state.profile.payout_lifetime_cap else "")
+                + ". Consistency window reset."
             )
             return 0
 

@@ -39,7 +39,7 @@ class TestArgumentParsing:
     def test_defaults_are_conservative(self):
         args = _args("--demo")
         assert args.symbol == "MNQ"          # micros, not minis
-        assert args.profile == "apex50k-intraday"
+        assert args.profile == "apex50k-pa"
         assert args.risk_per_trade == 250.0
         assert args.daily_loss == 600.0
         assert args.max_trades == 4
@@ -64,18 +64,38 @@ class TestStatePersistence:
         restored = load_state(_args("--demo", "--state", str(path)))
         assert restored.threshold == pytest.approx(state.threshold)
         assert restored.closed_balance == pytest.approx(state.closed_balance)
-        # The ratcheted room must survive the round trip, not reset to $2,500.
-        assert restored.room == pytest.approx(1_000.0)
+        # The ratcheted room must survive the round trip, not reset to $2,000.
+        assert restored.room == pytest.approx(500.0)
 
     def test_explicit_flags_override_the_state_file(self, tmp_path):
         path = tmp_path / "state.json"
         save_state(path, AccountState.fresh(APEX_50K_INTRADAY))
         args = _args(
-            "--demo", "--state", str(path), "--balance", "51000", "--threshold", "48900"
+            "--demo", "--state", str(path), "--balance", "51000", "--threshold", "49500"
         )
         state = load_state(args)
         assert state.closed_balance == 51_000.0
-        assert state.threshold == 48_900.0
+        assert state.threshold == 49_500.0
+
+    def test_impossible_threshold_is_raised_and_flagged(self, tmp_path):
+        """A threshold below what the drawdown allows means the wrong profile."""
+        from nqcopilot.apex import check_threshold_consistency
+
+        warning = check_threshold_consistency(APEX_50K_INTRADAY, 51_000.0, 48_900.0)
+        assert warning is not None
+        assert "wrong profile" in warning
+
+        args = _args(
+            "--demo", "--state", str(tmp_path / "s.json"),
+            "--balance", "51000", "--threshold", "48900",
+        )
+        # The engine uses the arithmetically forced value, never the lower one.
+        assert load_state(args).threshold == pytest.approx(49_000.0)
+
+    def test_consistent_threshold_produces_no_warning(self):
+        from nqcopilot.apex import check_threshold_consistency
+
+        assert check_threshold_consistency(APEX_50K_INTRADAY, 51_000.0, 49_500.0) is None
 
     def test_missing_state_file_falls_back_to_profile_defaults(self, tmp_path):
         state = load_state(_args("--demo", "--state", str(tmp_path / "absent.json")))
@@ -120,7 +140,7 @@ class TestStatePersistence:
         state = load_state(_args("--demo", "--state", str(path), "--open-pnl", "800"))
         assert state.equity == pytest.approx(50_800.0)
         # An intraday account ratchets on unrealised profit immediately.
-        assert state.threshold == pytest.approx(48_300.0)
+        assert state.threshold == pytest.approx(48_800.0)
 
 
 class TestStateCommands:
@@ -138,7 +158,7 @@ class TestStateCommands:
         main(["--state", str(path), "--record-trade", "500"])
         stored = json.loads(path.read_text())
         assert stored["closed_balance"] == pytest.approx(50_500.0)
-        assert stored["threshold"] == pytest.approx(48_000.0)
+        assert stored["threshold"] == pytest.approx(48_500.0)
 
     def test_record_trade_requires_a_state_file(self):
         with pytest.raises(SystemExit):

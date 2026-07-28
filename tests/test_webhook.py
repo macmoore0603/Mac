@@ -24,6 +24,7 @@ from nqcopilot.contracts import MNQ
 from nqcopilot.data import generate_demo_bars
 from nqcopilot.webhook import (
     BarStore,
+    LivePosition,
     WebhookConfig,
     WebhookContext,
     WebhookError,
@@ -303,7 +304,7 @@ class TestServer:
         assert status == 200
         payload = json.loads(body)
         assert "action" in payload and "account" in payload
-        assert payload["account"]["threshold"] == pytest.approx(47_500.0)
+        assert payload["account"]["threshold"] == pytest.approx(48_000.0)
 
     def test_decision_respects_account_rules(self, server):
         """The live feed goes through the same risk veto as everything else."""
@@ -350,3 +351,171 @@ class TestUnauthenticatedServer:
             assert len(context.store) == 1
         finally:
             server.shutdown()
+
+
+class TestRealTimeMarking:
+    """The threshold tracks peak equity in real time, not on bar close.
+
+    Waiting for a 5-minute bar before marking means reporting room the account
+    no longer has: a spike two minutes in has already moved the threshold.
+    """
+
+    @pytest.fixture
+    def ctx(self):
+        state = AccountState.fresh(APEX_50K_INTRADAY, today=DEMO_END.date())
+        return WebhookContext(
+            config=WebhookConfig(host="127.0.0.1", port=0),
+            spec=MNQ,
+            state=state,
+            store=BarStore(),
+        )
+
+    def test_price_mark_ratchets_the_threshold_immediately(self, ctx):
+        ctx.set_position(LivePosition(side=1, quantity=10, entry=20_000.0))
+        before = ctx.state.threshold
+
+        # +50 points on 10 micros = $1,000 of unrealised profit.
+        snapshot = ctx.mark_price(20_050.0)
+
+        assert snapshot["open_pnl"] == pytest.approx(1_000.0)
+        assert snapshot["threshold"] == pytest.approx(before + 1_000.0)
+        assert snapshot["room"] == pytest.approx(2_000.0)
+
+    def test_giving_it_back_costs_room_in_real_time(self, ctx):
+        ctx.set_position(LivePosition(side=1, quantity=10, entry=20_000.0))
+        ctx.mark_price(20_050.0)          # +$1,000 unrealised
+        snapshot = ctx.mark_price(20_000.0)  # straight back to entry
+
+        assert snapshot["open_pnl"] == pytest.approx(0.0)
+        assert snapshot["room"] == pytest.approx(1_000.0)  # half the buffer, gone
+
+    def test_short_positions_mark_the_other_way(self, ctx):
+        ctx.set_position(LivePosition(side=-1, quantity=5, entry=20_000.0))
+        snapshot = ctx.mark_price(19_900.0)  # 100 points in favour
+        assert snapshot["open_pnl"] == pytest.approx(1_000.0)
+
+    def test_mark_by_pnl_directly(self, ctx):
+        snapshot = ctx.mark_pnl(750.0)
+        assert snapshot["open_pnl"] == pytest.approx(750.0)
+        assert snapshot["threshold"] == pytest.approx(48_750.0)
+
+    def test_clearing_the_position_zeroes_open_pnl(self, ctx):
+        ctx.set_position(LivePosition(side=1, quantity=10, entry=20_000.0))
+        ctx.mark_price(20_050.0)
+        snapshot = ctx.set_position(None)
+        assert snapshot["open_pnl"] == 0.0
+        # The ratchet is permanent; clearing the position does not give it back.
+        assert snapshot["threshold"] == pytest.approx(49_000.0)
+
+    def test_bar_close_marks_the_favourable_extreme(self, ctx):
+        """A spike inside the bar already moved the threshold in reality."""
+        ctx.set_position(LivePosition(side=1, quantity=10, entry=20_000.0))
+        bar = Bar(
+            ts=_BASE,
+            open=20_000.0,
+            high=20_060.0,   # +$1,200 at the intrabar peak
+            low=19_995.0,
+            close=20_000.0,  # but closes flat
+            volume=500.0,
+        )
+        ctx.handle_bar(bar, {})
+        # Threshold reflects the peak, not the close.
+        assert ctx.state.threshold == pytest.approx(49_200.0)
+        assert ctx.state.open_pnl == pytest.approx(0.0)
+
+    def test_flat_bars_do_not_ratchet(self, ctx):
+        before = ctx.state.threshold
+        ctx.handle_bar(_bar(0), {})
+        assert ctx.state.threshold == pytest.approx(before)
+
+    def test_breach_is_visible_immediately(self, ctx):
+        ctx.set_position(LivePosition(side=1, quantity=10, entry=20_000.0))
+        snapshot = ctx.mark_price(19_900.0)  # -$2,000 unrealised
+        assert snapshot["breached"] is True
+
+    def test_position_parsing_accepts_common_spellings(self):
+        from nqcopilot.webhook import _parse_position
+
+        assert _parse_position({"side": "buy", "quantity": 2, "entry": 1.0}).side == 1
+        assert _parse_position({"side": "SHORT", "quantity": 2, "entry": 1.0}).side == -1
+        assert _parse_position({"side": "flat"}) is None
+        assert _parse_position({}) is None
+
+    def test_position_parsing_rejects_nonsense(self):
+        from nqcopilot.webhook import _parse_position
+
+        with pytest.raises(WebhookError, match="unknown side"):
+            _parse_position({"side": "sideways", "quantity": 1, "entry": 1.0})
+        with pytest.raises(WebhookError, match="numeric"):
+            _parse_position({"side": "long"})
+        with pytest.raises(WebhookError, match="positive"):
+            _parse_position({"side": "long", "quantity": 0, "entry": 1.0})
+
+
+class TestRealTimeEndpoints:
+    @pytest.fixture
+    def server(self):
+        state = AccountState.fresh(APEX_50K_INTRADAY, today=DEMO_END.date())
+        context = WebhookContext(
+            config=WebhookConfig(host="127.0.0.1", port=0, secret="s3cret"),
+            spec=MNQ,
+            state=state,
+            store=BarStore(),
+        )
+        srv = WebhookServer(context)
+        srv.start_background()
+        yield srv
+        srv.shutdown()
+
+    @staticmethod
+    def _post(server, path, payload):
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request("POST", path, body=json.dumps(payload))
+        response = conn.getresponse()
+        data = response.read().decode()
+        conn.close()
+        return response.status, json.loads(data) if data else {}
+
+    @staticmethod
+    def _get(server, path):
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        data = response.read().decode()
+        conn.close()
+        return response.status, json.loads(data) if data else {}
+
+    def test_declare_position_then_mark(self, server):
+        status, _ = self._post(
+            server, "/position",
+            {"secret": "s3cret", "side": "long", "quantity": 10, "entry": 20_000.0},
+        )
+        assert status == 200
+
+        status, snapshot = self._post(server, "/mark", {"secret": "s3cret", "price": 20_050.0})
+        assert status == 200
+        assert snapshot["open_pnl"] == pytest.approx(1_000.0)
+        assert snapshot["threshold"] == pytest.approx(49_000.0)
+        assert snapshot["room"] == pytest.approx(2_000.0)
+
+    def test_account_endpoint_is_pollable(self, server):
+        status, snapshot = self._get(server, "/account")
+        assert status == 200
+        assert snapshot["threshold"] == pytest.approx(48_000.0)
+        assert snapshot["room"] == pytest.approx(2_000.0)
+        assert snapshot["position"] is None
+
+    def test_mark_requires_authentication(self, server):
+        status, _ = self._post(server, "/mark", {"price": 20_050.0})
+        assert status == 401
+
+    def test_position_requires_authentication(self, server):
+        status, _ = self._post(
+            server, "/position", {"side": "long", "quantity": 1, "entry": 1.0}
+        )
+        assert status == 401
+
+    def test_mark_without_price_or_pnl_is_rejected(self, server):
+        status, body = self._post(server, "/mark", {"secret": "s3cret"})
+        assert status == 400
+        assert "price" in body["error"]

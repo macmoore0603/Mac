@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 279 tests. A hard rule gate always beats
+These are deterministic and covered by 348 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -44,19 +44,19 @@ On an intraday trailing-threshold account, the threshold follows your peak
 **equity** — including profit you have not booked yet.
 
 ```
-Start:              balance $50,000    threshold $47,500    room $2,500
-Trade runs +$1,500: equity  $51,500    threshold $49,000    room $2,500
-Gives it all back:  balance $50,000    threshold $49,000    room $1,000
+Start:              balance $50,000    threshold $48,000    room $2,000
+Trade runs +$1,500: equity  $51,500    threshold $49,500    room $2,000
+Gives it all back:  balance $50,000    threshold $49,500    room $500
 ```
 
-You booked nothing. You lost 60% of your buffer anyway, permanently.
+You booked nothing. You lost 75% of your buffer anyway, permanently.
 
 Most traders discover this the second time it happens. The copilot models it
 explicitly, warns you before entry how much room a runner will consume, and
 tells you the exact profit that locks the threshold for good:
 
 ```
-· $2,600.00 more peak equity locks the threshold at $50,100.00 permanently.
+· $2,100.00 more peak equity locks the threshold at $50,100.00 permanently.
 · If this runs to target 2 (+$658.00 open) your threshold rises $658.00.
   That room is permanent — do not let a winner round-trip to breakeven.
 ```
@@ -88,7 +88,7 @@ PYTHONPATH=src python3 -m nqcopilot.cli --demo
 nqcopilot --demo
 
 # Your real account, bars exported from your platform
-nqcopilot --csv nq_5m.csv --symbol MNQ --balance 51200 --threshold 48700
+nqcopilot --csv nq_5m.csv --symbol MNQ --balance 51200 --threshold 49200
 
 # Live-ish delayed data, refreshing every minute
 nqcopilot --live --symbol MNQ --state ~/.nqcopilot.json --watch 60
@@ -127,8 +127,8 @@ Output:
     ! On the wrong side of session VWAP
 
   ACCOUNT
-    · Equity $50,000.00 | threshold $47,500.00 | room $2,500.00
-    · Risk $229.88 all-in (stop loss plus commission) of your $2,500.00 room — 9.2%
+    · Equity $50,000.00 | threshold $48,000.00 | room $2,000.00
+    · Risk $229.88 all-in (stop loss plus commission) of your $2,000.00 room — 11.5%
     · Scale: take 3 off at 20,442.25 (+$141.00), trail the remaining 4 toward 20,465.75
     · Move the stop to breakeven once price reaches 20,434.50 (1.0R)
 ```
@@ -164,6 +164,66 @@ cloudflared tunnel --url http://localhost:8787
 Every bar close now prints a full decision card, and the account state advances
 exactly as it would live. `GET /health` reports ingestion status; `GET /decision`
 returns the latest read as JSON.
+
+### Real-time drawdown tracking
+
+The Apex threshold follows peak equity **in real time**, including unrealised
+profit. Marking only on bar close would report room the account no longer has —
+a spike two minutes into a five-minute bar has already moved your threshold.
+
+Two mechanisms keep the copilot in step:
+
+**Automatic.** When a position is open, each arriving bar is marked at its
+*favourable extreme* before its close, so an intrabar spike ratchets the
+threshold exactly as it did in reality.
+
+**Continuous.** Declare your position, then push prices as often as you like:
+
+```bash
+curl -X POST localhost:8787/position -d \
+  '{"secret":"...","side":"long","quantity":10,"entry":20000}'
+
+curl -X POST localhost:8787/mark -d '{"secret":"...","price":20050}'
+# → {"open_pnl": 1000.0, "threshold": 49000.0, "room": 2000.0, ...}
+```
+
+`POST /mark` accepts `price` (converted using your declared position) or
+`open_pnl` directly, for feeds that report P&L. `GET /account` is cheap enough
+to poll every second for a live room readout. Drive it from your broker's API,
+a small poller, or the indicator with alerts on every tick.
+
+This is what makes the giveback visible as it happens rather than afterwards:
+
+```
+mark 20050 → open_pnl $1,000   threshold $49,000   room $2,000
+mark 20000 → open_pnl     $0   threshold $49,000   room $1,000
+```
+
+Half the buffer gone, nothing booked, and you can see it the moment it happens.
+
+### Payout tracking
+
+The PA payout rules are modelled and reported on every card:
+
+```
+  PAYOUT
+      Payout eligible: $2,000.00 withdrawable, 5 qualifying days, best day 20% of total.
+      Days 5/5  withdrawable $2,000.00  best day $420.00 of $2,100.00
+```
+
+All four gates are checked — the 50% consistency rule (measured since your last
+payout, not since account open), 5 qualifying days, the $500 minimum against
+profit above the safety net, and the 6-payout lifetime cap.
+
+Book withdrawals so the consistency window resets correctly:
+
+```bash
+nqcopilot --state ~/.apex.json --record-payout 1500
+```
+
+Worth seeing before you request one: a withdrawal lowers your balance but the
+threshold never moves down, so taking $1,500 out of a $52,100 account leaves you
+with $500 of room, not $2,000. The command prints exactly that.
 
 The card also cross-checks the chart's own read against the engine's and tells
 you when they disagree — which usually means the engine knows something about
@@ -245,7 +305,7 @@ working from stale numbers and its guarantees no longer hold.
 |---|---|---|
 | Account breached | equity ≤ threshold | Nothing else matters |
 | Insufficient room | < $400 | Not enough buffer to survive a normal loss |
-| Daily loss limit | −$600 | Apex imposes none, which is why you must |
+| Daily loss limit | −$600 | Self-imposed. Evaluations enforce none; PAs are tier-based (`--firm-daily-loss`) |
 | Daily profit lock | +$900 | Giving back a green day is how accounts stall |
 | Trade count | 4/day | Overtrading is the most common blow-up path |
 | Loss streak | 2 in a row | You are misreading the session; stop |
@@ -305,19 +365,43 @@ Prop-firm rules change without notice and differ between variants (evaluation
 vs PA, intraday vs end-of-day, Rithmic vs Tradovate). **Every parameter is
 configurable, and the bundled presets are a starting point, not an authority.**
 
-The `apex50k-intraday` preset assumes: $2,500 drawdown, threshold starting at
-$47,500 and freezing at $50,100, 10 minis / 100 micros, 30% consistency rule.
-Published third-party summaries disagree on the lock level in particular. **Open
-your Apex dashboard and confirm these before trading**; the CLI prints them on
-every run for exactly that reason.
+Presets follow Apex's published intraday trailing-drawdown rules:
+
+| | Evaluation (`apex50k-eval`) | Performance Account (`apex50k-pa`) |
+|---|---|---|
+| Profit target | $3,000 | — |
+| Drawdown | $2,000 real-time intraday | $2,000 real-time intraday |
+| Threshold start | $48,000 | $48,000 |
+| Threshold lock | not set (see below) | $50,100 = start + $100 |
+| Daily loss limit | none enforced | **tier-based — set it yourself** |
+| Contracts | 10 minis / 100 micros | **tier-based — set it yourself** |
+| Min trading days | none | 5 qualifying days |
+| Consistency | none | 50%, since last payout |
+| Payouts | — | $500 minimum, 6 lifetime |
+
+Two things the presets deliberately do **not** guess:
+
+- **Tier-based limits.** A PA's contract cap and daily loss limit depend on
+  where you are in the scaling ladder. Pass `--max-contracts` and
+  `--firm-daily-loss` from your own tier. `--firm-daily-loss` is treated as a
+  firm rule that ends the account, distinct from `--daily-loss` which is your
+  own discipline.
+- **The evaluation lock level.** Evaluations stop trailing at "starting balance
+  plus an offset" whose value differs by platform. Left unset, which assumes the
+  threshold never stops trailing — that understates your room rather than
+  overstating it. Set it once you have confirmed the number.
+
+The copilot also refuses to accept impossible numbers: a threshold further below
+your balance than the drawdown allows means the wrong profile is selected, and it
+says so rather than quietly reporting room you do not have.
 
 To change them:
 
 ```python
 from dataclasses import replace
-from nqcopilot.apex import APEX_50K_INTRADAY
+from nqcopilot.apex import APEX_50K_PA
 
-my_account = replace(APEX_50K_INTRADAY, drawdown_amount=2_000.0, threshold_lock=52_100.0)
+my_account = replace(APEX_50K_PA, max_contracts=4, firm_daily_loss_limit=1_100.0)
 ```
 
 ---

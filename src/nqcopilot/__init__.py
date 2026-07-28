@@ -12,6 +12,8 @@ Start with `playbook.evaluate`, which returns a single `Directive`.
 """
 
 from .apex import (
+    APEX_50K_EVAL,
+    APEX_50K_PA,
     PRESETS,
     AccountProfile,
     AccountState,
@@ -21,7 +23,8 @@ from .apex import (
     Severity,
     Sizing,
     TrailingMode,
-    consistency_status,
+    check_threshold_consistency,
+    payout_status,
 )
 from .backtest import BacktestConfig, BacktestResult, CompletedTrade, run_backtest
 from .bars import Bar, Session, classify_session, trading_date
@@ -37,6 +40,8 @@ __version__ = "1.0.0"
 
 __all__ = [
     "Action",
+    "APEX_50K_EVAL",
+    "APEX_50K_PA",
     "AccountProfile",
     "AccountState",
     "BacktestConfig",
@@ -69,7 +74,8 @@ __all__ = [
     "Sizing",
     "TrailingMode",
     "classify_session",
-    "consistency_status",
+    "check_threshold_consistency",
+    "payout_status",
     "detect_all",
     "evaluate",
     "fetch_economic_calendar",

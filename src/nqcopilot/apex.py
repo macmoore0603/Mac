@@ -48,14 +48,35 @@ class AccountProfile:
     max_contracts: int              # in minis; micros allowed at 10x
     threshold_lock: float | None = None   # threshold freezes at this level
     profit_target: float | None = None
-    consistency_pct: float | None = None  # e.g. 0.30 for the 30% rule
+    consistency_pct: float | None = None  # e.g. 0.50 for the 50% rule
     flatten_by: time = APEX_FLATTEN_BY
     allow_overnight: bool = False
     verify_note: str = ""
 
+    # Firm-imposed daily loss limit. Apex enforces none during evaluation, but
+    # Performance Accounts carry a tier-based one. Set it from your tier: this
+    # is a hard rule that can end the account, unlike the self-imposed limit in
+    # RiskLimits which merely protects you.
+    firm_daily_loss_limit: float | None = None
+
+    # Payout rules. Zero/None disables the corresponding check.
+    payout_min_days: int = 0            # qualifying trading days required
+    payout_min_daily_profit: float = 0.0  # what makes a day "qualifying"
+    payout_minimum: float = 0.0         # smallest withdrawal allowed
+    payout_lifetime_cap: int | None = None  # total payouts per account
+
     @property
     def initial_threshold(self) -> float:
         return self.starting_balance - self.drawdown_amount
+
+    @property
+    def safety_net(self) -> float | None:
+        """Balance above which profits become withdrawable.
+
+        Apex sets this at the level where the threshold stops trailing, so it
+        coincides with `threshold_lock`.
+        """
+        return self.threshold_lock
 
     def contract_cap(self, spec: ContractSpec) -> int:
         """Maximum quantity of `spec` this account may hold."""
@@ -67,23 +88,61 @@ class AccountProfile:
 # --------------------------------------------------------------------------
 # Presets
 # --------------------------------------------------------------------------
-# These reflect the widely-published parameters for Apex's $50K intraday
-# trailing-threshold account. Published third-party summaries disagree on the
-# lock level in particular, and Apex has shipped several account variants, so
-# treat these as defaults to confirm rather than facts to rely on.
+# Parameters below follow Apex's published intraday trailing-drawdown rules:
+#
+#   Evaluation — $3,000 target, $2,000 real-time intraday trailing drawdown
+#   following peak balance including open profit, no daily loss limit, no
+#   minimum trading days.
+#
+#   Performance Account — same real-time intraday tracking, threshold stops
+#   trailing permanently at starting balance + $100 ($50,100 on a 50K), which
+#   is also the safety net above which profits are withdrawable. Payouts need
+#   5 qualifying trading days, obey a 50% consistency rule since the last
+#   payout, have a $500 minimum, and are capped at 6 per account.
+#
+# Contract and daily-loss limits on a PA are tier-based and are NOT encoded
+# here, because they depend on where you are in the scaling ladder. Set
+# `max_contracts` and `firm_daily_loss_limit` from your own tier.
 
-APEX_50K_INTRADAY = AccountProfile(
-    name="Apex $50K (intraday trailing)",
+APEX_50K_PA = AccountProfile(
+    name="Apex $50K PA (intraday trailing)",
     starting_balance=50_000.0,
-    drawdown_amount=2_500.0,
+    drawdown_amount=2_000.0,
     trailing_mode=TrailingMode.INTRADAY,
     max_contracts=10,
-    threshold_lock=50_100.0,
+    threshold_lock=50_100.0,          # starting balance + $100
     profit_target=3_000.0,
-    consistency_pct=0.30,
+    consistency_pct=0.50,             # no day may be 50% or more of the total
+    payout_min_days=5,
+    payout_min_daily_profit=50.0,
+    payout_minimum=500.0,
+    payout_lifetime_cap=6,
     verify_note=(
-        "Confirm against your Apex dashboard: drawdown $2,500, threshold starts "
-        "$47,500, freezes at $50,100, cap 10 minis / 100 micros, 30% consistency."
+        "Drawdown $2,000 (threshold starts $47,500... locks at $50,100 = start + $100). "
+        "Contract cap and daily loss limit are TIER-BASED — set --max-contracts and "
+        "--firm-daily-loss from your current tier. Minimum qualifying day ($50) "
+        "should be confirmed for your account size."
+    ),
+)
+
+APEX_50K_EVAL = AccountProfile(
+    name="Apex $50K Evaluation (intraday trailing)",
+    starting_balance=50_000.0,
+    drawdown_amount=2_000.0,
+    trailing_mode=TrailingMode.INTRADAY,
+    max_contracts=10,
+    # Evaluation locks at "starting balance plus an offset" whose value differs
+    # by platform. Left unset deliberately: an unset lock means the threshold is
+    # assumed to trail forever, which understates your room rather than
+    # overstating it. Set it once you have confirmed the number.
+    threshold_lock=None,
+    profit_target=3_000.0,
+    consistency_pct=None,     # no consistency requirement during evaluation
+    firm_daily_loss_limit=None,  # none enforced during evaluation
+    verify_note=(
+        "Evaluation: $3,000 target, $2,000 intraday trailing drawdown, no daily "
+        "loss limit, no minimum trading days. Threshold lock left unset (assumes "
+        "it never stops trailing) — conservative until you confirm the offset."
     ),
 )
 
@@ -95,14 +154,24 @@ APEX_50K_EOD = AccountProfile(
     max_contracts=10,
     threshold_lock=52_100.0,
     profit_target=3_000.0,
-    consistency_pct=0.30,
-    verify_note="Confirm against your Apex dashboard: EOD trailing, $2,000 drawdown.",
+    consistency_pct=0.50,
+    payout_min_days=5,
+    payout_min_daily_profit=50.0,
+    payout_minimum=500.0,
+    payout_lifetime_cap=6,
+    verify_note="Confirm against your dashboard: EOD trailing, $2,000 drawdown.",
 )
 
 PRESETS: dict[str, AccountProfile] = {
-    "apex50k-intraday": APEX_50K_INTRADAY,
+    "apex50k-pa": APEX_50K_PA,
+    "apex50k-eval": APEX_50K_EVAL,
     "apex50k-eod": APEX_50K_EOD,
+    # Retained so existing state files and scripts keep working.
+    "apex50k-intraday": APEX_50K_PA,
 }
+
+# Backwards-compatible alias.
+APEX_50K_INTRADAY = APEX_50K_PA
 
 
 @dataclass(frozen=True)
@@ -167,6 +236,10 @@ class AccountState:
     trades_today: int = 0
     consecutive_losses: int = 0
     daily_pnl: dict[date, float] = field(default_factory=dict)
+    # Payout history. The consistency rule and the qualifying-day count are both
+    # measured since the last payout, so this window matters.
+    last_payout_date: date | None = None
+    payouts_taken: int = 0
 
     @classmethod
     def fresh(cls, profile: AccountProfile, today: date | None = None) -> "AccountState":
@@ -281,6 +354,20 @@ class AccountState:
         self.trades_today = 0
         self.consecutive_losses = 0
         self.open_pnl = 0.0
+
+    def record_payout(self, amount: float, on_date: date | None = None) -> None:
+        """Book a withdrawal, resetting the consistency and qualifying-day window.
+
+        The balance drops by the amount withdrawn. The threshold does not move:
+        it only ever follows peak equity upward, so a withdrawal reduces your
+        room by exactly what you took out.
+        """
+        if amount <= 0:
+            raise ValueError("payout amount must be positive")
+        self.closed_balance -= amount
+        self.payouts_taken += 1
+        self.last_payout_date = on_date or self.session_date
+        self.day_start_balance = self.closed_balance
 
     # -- forward-looking helpers ------------------------------------------
 
@@ -459,6 +546,19 @@ class RiskEngine:
                 )
             )
 
+        # The firm's own daily loss limit ends the account, unlike the
+        # self-imposed one below which merely ends the day. Checked first and
+        # reported distinctly so the difference is never ambiguous.
+        firm_limit = s.profile.firm_daily_loss_limit
+        if firm_limit is not None and s.day_pnl <= -firm_limit:
+            blockers.append(
+                Blocker(
+                    "firm_daily_loss_limit",
+                    f"FIRM daily loss limit breached: ${s.day_pnl:,.2f} vs "
+                    f"-${firm_limit:,.2f}. This is an account rule, not a preference.",
+                )
+            )
+
         if s.day_pnl <= -lim.daily_loss_limit:
             blockers.append(
                 Blocker(
@@ -523,6 +623,11 @@ class RiskEngine:
             ("threshold_buffer", room_budget),
             ("daily_loss_limit", daily_budget),
         ]
+        firm_limit = s.profile.firm_daily_loss_limit
+        if firm_limit is not None:
+            candidates.append(
+                ("firm_daily_loss_limit", max(0.0, firm_limit + min(0.0, s.day_pnl)))
+            )
         limiting_factor, risk_budget = min(candidates, key=lambda kv: kv[1])
 
         quantity = int(math.floor(risk_budget / risk_per_contract)) if risk_per_contract > 0 else 0
@@ -565,75 +670,193 @@ class RiskEngine:
         return None
 
 
-@dataclass(frozen=True)
-class ConsistencyStatus:
-    """Where you stand against the payout consistency rule."""
+def check_threshold_consistency(
+    profile: AccountProfile, closed_balance: float, threshold: float
+) -> str | None:
+    """Detect a threshold that contradicts the profile's drawdown amount.
 
+    The threshold can never sit further below the balance than the drawdown
+    allows, so a lower one means the numbers came from a different account type
+    than the selected profile. That is worth shouting about: a profile with too
+    large a drawdown would report room the account does not have.
+    """
+    implied_minimum = closed_balance - profile.drawdown_amount
+    if profile.threshold_lock is not None:
+        implied_minimum = min(implied_minimum, profile.threshold_lock)
+
+    if threshold < implied_minimum - 0.01:
+        return (
+            f"threshold ${threshold:,.2f} sits ${implied_minimum - threshold:,.2f} below "
+            f"the lowest value a ${profile.drawdown_amount:,.0f} drawdown allows at a "
+            f"${closed_balance:,.2f} balance (${implied_minimum:,.2f}). Either the "
+            f"balance/threshold pair is stale, or '{profile.name}' is the wrong profile "
+            f"for this account. The engine will use ${implied_minimum:,.2f}."
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class PayoutStatus:
+    """Where you stand against every payout requirement."""
+
+    # Consistency rule
     best_day: float
-    total_profit: float
+    total_profit: float          # accumulated since the last payout
     required_total: float | None
     compliant: bool
     max_additional_today: float | None
+    # Qualifying-days rule
+    qualifying_days: int
+    required_days: int
+    days_ok: bool
+    # Amount rules
+    withdrawable: float
+    minimum_payout: float
+    amount_ok: bool
+    # Lifetime cap
+    payouts_taken: int
+    lifetime_cap: int | None
+    cap_ok: bool
+    # Overall
+    eligible: bool
+    blockers: list[str]
     message: str
 
 
-def consistency_status(
-    state: AccountState, today_profit: float | None = None
-) -> ConsistencyStatus:
-    """Evaluate the 30%-style consistency rule for payout eligibility.
+def payout_status(state: AccountState, today_profit: float | None = None) -> PayoutStatus:
+    """Evaluate every payout requirement at once.
 
-    The rule caps any single day at a fraction of total profit at payout time.
-    Its practical bite is counter-intuitive: a huge green day does not
-    disqualify you, it raises the *total* profit you must accumulate before you
-    can withdraw. This reports both numbers and, when a day is running hot, how
-    much more can be banked today without pushing the bar higher.
+    Four independent gates, all of which must pass:
+
+    1. **Consistency.** No single day may be `consistency_pct` *or more* of the
+       total profit since your last payout. Counter-intuitively, a huge green
+       day does not disqualify you — it raises the total you must accumulate
+       before you can withdraw.
+    2. **Qualifying days.** A minimum number of separate trading days each
+       clearing a minimum profit.
+    3. **Amount.** Only profit above the safety net is withdrawable, and the
+       request must clear the minimum.
+    4. **Lifetime cap.** A finite number of payouts per account.
+
+    Everything is measured *since the last payout*, which is what the rule
+    actually says — so accuracy depends on booking trades with `record_trade`
+    and payouts with `record_payout`.
     """
-    pct = state.profile.consistency_pct
+    profile = state.profile
     realised_today = state.day_pnl if today_profit is None else today_profit
 
-    days = dict(state.daily_pnl)
-    if state.session_date is not None:
-        days[state.session_date] = realised_today
+    # Only days after the last payout count toward consistency and day counts.
+    days = {
+        day: value
+        for day, value in state.daily_pnl.items()
+        if state.last_payout_date is None or day > state.last_payout_date
+    }
+    if state.session_date is not None and (
+        state.last_payout_date is None or state.session_date > state.last_payout_date
+    ):
+        if today_profit is not None:
+            days[state.session_date] = today_profit
+        else:
+            # `close_trade` already records the session's P&L, and `day_pnl` is
+            # derived from `day_start_balance`, which `end_session` resets. Only
+            # fall back to it when nothing has been recorded for today, or a
+            # mid-day session reset would erase the day from the payout history.
+            days.setdefault(state.session_date, realised_today)
 
-    total_profit = state.closed_balance - state.profile.starting_balance
-    positive_days = [v for v in days.values() if v > 0]
-    best_day = max(positive_days) if positive_days else 0.0
+    if state.last_payout_date is None:
+        total_profit = state.closed_balance - profile.starting_balance
+    else:
+        total_profit = sum(days.values())
 
+    positive = [v for v in days.values() if v > 0]
+    best_day = max(positive) if positive else 0.0
+
+    blockers: list[str] = []
+
+    # --- 1. consistency --------------------------------------------------
+    pct = profile.consistency_pct
     if pct is None:
-        return ConsistencyStatus(
-            best_day, total_profit, None, True, None,
-            "No consistency rule configured for this profile.",
+        required_total: float | None = None
+        compliant = True
+        max_additional: float | None = None
+    else:
+        required_total = best_day / pct if best_day > 0 else 0.0
+        # The rule fails at "pct or more", so compliance is a strict inequality.
+        compliant = best_day <= 0 or best_day < pct * total_profit
+        max_additional = None
+        if realised_today > 0 and pct < 1:
+            # Bank at most x more while keeping today + x < pct * (total + x).
+            max_additional = max(0.0, (pct * total_profit - realised_today) / (1 - pct))
+        if not compliant:
+            blockers.append(
+                f"best day ${best_day:,.2f} needs ${required_total:,.2f} total "
+                f"(${required_total - total_profit:,.2f} more)"
+            )
+
+    # --- 2. qualifying days ----------------------------------------------
+    required_days = profile.payout_min_days
+    qualifying_days = sum(
+        1 for value in days.values() if value >= profile.payout_min_daily_profit and value > 0
+    )
+    days_ok = qualifying_days >= required_days
+    if not days_ok:
+        blockers.append(
+            f"{qualifying_days}/{required_days} qualifying days "
+            f"(≥${profile.payout_min_daily_profit:,.0f} profit each)"
         )
 
-    required_total = best_day / pct if best_day > 0 else 0.0
-    compliant = total_profit >= required_total
+    # --- 3. amount --------------------------------------------------------
+    safety_net = profile.safety_net
+    withdrawable = (
+        max(0.0, state.closed_balance - safety_net) if safety_net is not None else total_profit
+    )
+    minimum = profile.payout_minimum
+    amount_ok = withdrawable >= minimum if minimum > 0 else withdrawable > 0
+    if not amount_ok:
+        blockers.append(
+            f"${withdrawable:,.2f} above the safety net, need ${minimum:,.2f}"
+        )
 
-    # Banking more today only hurts while today *is* the best day and the
-    # account is not already over the required total.
-    max_additional: float | None = None
-    if realised_today > 0:
-        # Today may bank up to x more while keeping (today+x) <= pct*(total+x).
-        headroom = (pct * total_profit - realised_today) / (1 - pct) if pct < 1 else None
-        max_additional = max(0.0, headroom) if headroom is not None else None
+    # --- 4. lifetime cap --------------------------------------------------
+    cap = profile.payout_lifetime_cap
+    cap_ok = cap is None or state.payouts_taken < cap
+    if not cap_ok:
+        blockers.append(f"all {cap} lifetime payouts already taken")
 
-    if compliant:
+    eligible = compliant and days_ok and amount_ok and cap_ok
+
+    if pct is None and required_days == 0:
+        message = "No payout requirements configured for this profile."
+    elif eligible:
         message = (
-            f"Consistency OK: best day ${best_day:,.2f} is "
-            f"{(best_day / total_profit * 100) if total_profit > 0 else 0:.0f}% of "
-            f"${total_profit:,.2f} total."
+            f"Payout eligible: ${withdrawable:,.2f} withdrawable, "
+            f"{qualifying_days} qualifying days, best day "
+            f"{(best_day / total_profit * 100) if total_profit > 0 else 0:.0f}% of total."
         )
     else:
-        shortfall = required_total - total_profit
-        message = (
-            f"Consistency: best day ${best_day:,.2f} requires ${required_total:,.2f} "
-            f"total profit before payout; ${shortfall:,.2f} more needed."
-        )
+        message = "Payout blocked — " + "; ".join(blockers) + "."
 
-    return ConsistencyStatus(
+    return PayoutStatus(
         best_day=best_day,
         total_profit=total_profit,
         required_total=required_total,
         compliant=compliant,
         max_additional_today=max_additional,
+        qualifying_days=qualifying_days,
+        required_days=required_days,
+        days_ok=days_ok,
+        withdrawable=withdrawable,
+        minimum_payout=minimum,
+        amount_ok=amount_ok,
+        payouts_taken=state.payouts_taken,
+        lifetime_cap=cap,
+        cap_ok=cap_ok,
+        eligible=eligible,
+        blockers=blockers,
         message=message,
     )
+
+
+# Retained name for callers that only care about the consistency portion.
+consistency_status = payout_status
+ConsistencyStatus = PayoutStatus

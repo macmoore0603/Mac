@@ -191,6 +191,26 @@ def _parse_bar_time(payload: dict) -> datetime:
 
 
 @dataclass
+class LivePosition:
+    """An open position, so price marks can be turned into open P&L."""
+
+    side: int          # +1 long, -1 short
+    quantity: int
+    entry: float
+
+    def open_pnl(self, price: float, spec: ContractSpec) -> float:
+        move = (price - self.entry) * self.side
+        return spec.points_to_dollars(move, self.quantity)
+
+    def as_dict(self) -> dict:
+        return {
+            "side": "long" if self.side > 0 else "short",
+            "quantity": self.quantity,
+            "entry": self.entry,
+        }
+
+
+@dataclass
 class WebhookContext:
     """Everything a request handler needs, shared under one lock."""
 
@@ -202,12 +222,76 @@ class WebhookContext:
     playbook: PlaybookConfig | None = None
     indicators: IndicatorConfig | None = None
     on_directive: Callable[[Directive, dict], None] | None = None
+    on_mark: Callable[[dict], None] | None = None
 
+    position: LivePosition | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_directive: Directive | None = None
     last_meta: dict = field(default_factory=dict)
+    last_price: float | None = None
     received: int = 0
+    marks: int = 0
     rejected: int = 0
+
+    # -- real-time marking -------------------------------------------------
+
+    def mark_price(self, price: float) -> dict:
+        """Update open P&L from a live price and let the threshold ratchet.
+
+        The Apex intraday threshold follows peak equity in real time, including
+        unrealised profit. Waiting for a bar to close before marking means the
+        copilot reports room the account no longer has: a spike two minutes into
+        a five-minute bar has already moved the threshold. This is the endpoint
+        that keeps the two in step.
+        """
+        with self.lock:
+            self.last_price = price
+            open_pnl = (
+                self.position.open_pnl(price, self.spec) if self.position else 0.0
+            )
+            self.state.mark(open_pnl)
+            self.marks += 1
+            snapshot = self.account_snapshot()
+        if self.on_mark is not None:
+            self.on_mark(snapshot)
+        return snapshot
+
+    def mark_pnl(self, open_pnl: float) -> dict:
+        """Update open P&L directly, for feeds that report P&L not price."""
+        with self.lock:
+            self.state.mark(open_pnl)
+            self.marks += 1
+            snapshot = self.account_snapshot()
+        if self.on_mark is not None:
+            self.on_mark(snapshot)
+        return snapshot
+
+    def set_position(self, position: LivePosition | None) -> dict:
+        with self.lock:
+            self.position = position
+            if position is None:
+                self.state.mark(0.0)
+            elif self.last_price is not None:
+                self.state.mark(position.open_pnl(self.last_price, self.spec))
+            return self.account_snapshot()
+
+    def account_snapshot(self) -> dict:
+        """Current account arithmetic. Caller holds the lock, or does not care."""
+        state = self.state
+        return {
+            "equity": round(state.equity, 2),
+            "balance": round(state.closed_balance, 2),
+            "open_pnl": round(state.open_pnl, 2),
+            "threshold": round(state.threshold, 2),
+            "room": round(state.room, 2),
+            "peak_equity": round(state.peak_equity, 2),
+            "threshold_locked": state.threshold_is_locked,
+            "breached": state.is_breached,
+            "position": self.position.as_dict() if self.position else None,
+            "last_price": self.last_price,
+        }
+
+    # -- bar ingestion -----------------------------------------------------
 
     def handle_bar(self, bar: Bar, meta: dict) -> tuple[str, Directive | None]:
         """Ingest a bar and re-evaluate. Returns (disposition, directive)."""
@@ -217,6 +301,17 @@ class WebhookContext:
 
         bars = self.store.snapshot()
         with self.lock:
+            self.last_price = bar.close
+            if self.position is not None:
+                # Mark the bar's favourable extreme before its close. The peak
+                # inside the bar already ratcheted the threshold in reality, and
+                # marking only the close would understate how much room is gone.
+                peak = bar.high if self.position.side > 0 else bar.low
+                self.state.mark(self.position.open_pnl(peak, self.spec))
+                self.state.mark(self.position.open_pnl(bar.close, self.spec))
+            else:
+                self.state.mark(0.0)
+
             directive = evaluate(
                 bars,
                 self.spec,
@@ -224,6 +319,7 @@ class WebhookContext:
                 risk=self.engine,
                 config=self.playbook,
                 indicators=self.indicators,
+                in_position=self.position is not None,
             )
             self.last_directive = directive
             self.last_meta = meta
@@ -232,6 +328,28 @@ class WebhookContext:
         if self.on_directive is not None:
             self.on_directive(directive, meta)
         return disposition, directive
+
+
+def _parse_position(payload: dict) -> LivePosition | None:
+    """Read a position declaration. A flat/empty side clears it."""
+    side_raw = str(payload.get("side", "")).strip().lower()
+    if side_raw in ("", "flat", "none", "closed"):
+        return None
+    if side_raw in ("long", "buy", "1", "+1"):
+        side = 1
+    elif side_raw in ("short", "sell", "-1"):
+        side = -1
+    else:
+        raise WebhookError(f"unknown side {payload.get('side')!r}")
+
+    try:
+        quantity = int(payload["quantity"])
+        entry = float(payload["entry"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WebhookError("position needs numeric 'quantity' and 'entry'") from exc
+    if quantity <= 0:
+        raise WebhookError("quantity must be positive")
+    return LivePosition(side=side, quantity=quantity, entry=entry)
 
 
 def _authorised(context: WebhookContext, payload: dict, headers) -> bool:
@@ -295,11 +413,16 @@ def create_handler(context: WebhookContext) -> type[BaseHTTPRequestHandler]:
 
                 self._respond(200, directive_to_dict(directive, context.state))
                 return
+            if path == "/account":
+                # Cheap enough to poll every second for a live room readout.
+                self._respond(200, context.account_snapshot())
+                return
             self._respond(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 - http.server API
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
-            if path != context.config.path.rstrip("/"):
+            known = {context.config.path.rstrip("/"), "/mark", "/position"}
+            if path not in known:
                 self._respond(404, {"error": "not found"})
                 return
 
@@ -330,6 +453,33 @@ def create_handler(context: WebhookContext) -> type[BaseHTTPRequestHandler]:
                 context.rejected += 1
                 # Deliberately vague: do not confirm whether a secret is set.
                 self._respond(401, {"error": "unauthorised"})
+                return
+
+            # --- real-time mark: price or P&L between bar closes -----------
+            if path == "/mark":
+                try:
+                    if "price" in payload and payload["price"] is not None:
+                        snapshot = context.mark_price(float(payload["price"]))
+                    elif "open_pnl" in payload and payload["open_pnl"] is not None:
+                        snapshot = context.mark_pnl(float(payload["open_pnl"]))
+                    else:
+                        raise WebhookError("send either 'price' or 'open_pnl'")
+                except (TypeError, ValueError) as exc:
+                    context.rejected += 1
+                    self._respond(400, {"error": str(exc)})
+                    return
+                self._respond(200, snapshot)
+                return
+
+            # --- declare or clear the open position ------------------------
+            if path == "/position":
+                try:
+                    snapshot = context.set_position(_parse_position(payload))
+                except WebhookError as exc:
+                    context.rejected += 1
+                    self._respond(400, {"error": str(exc)})
+                    return
+                self._respond(200, snapshot)
                 return
 
             try:
