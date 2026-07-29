@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest *)",
+      "Bash(python -m pytest *)",
+      "Bash(pytest *)",
+      "Bash(nqcopilot *)",
+      "Bash(python3 -m nqcopilot *)",
+      "mcp__github__pull_request_read",
+      "mcp__github__get_job_logs",
+      "mcp__github__list_pull_requests",
+      "mcp__github__actions_list"
+    ]
+  }
+}
