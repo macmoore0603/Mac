@@ -32,6 +32,7 @@ from .bars import ET, Bar, classify_session, validate_series
 from .calendar import CalendarError, EconomicEvent, fetch_economic_calendar
 from .contracts import get_contract
 from .data import DataError, fetch_live, generate_demo_bars, load_csv
+from .feed import BarAggregator, FeedError, HttpQuoteSource
 from .market import IndicatorConfig
 from .playbook import Action, Directive, PlaybookConfig, evaluate
 from .webhook import BarStore, WebhookConfig, WebhookContext, WebhookServer
@@ -220,6 +221,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared secret the alert must send. Falls back to NQCOPILOT_WEBHOOK_SECRET.",
     )
 
+    poll = parser.add_argument_group("live feed from a quote endpoint")
+    poll.add_argument(
+        "--poll",
+        metavar="URL",
+        help="Poll a JSON endpoint for a price and build bars from it. Prefer "
+        "your broker's licensed API (Tradovate/Rithmic) over a public page.",
+    )
+    poll.add_argument(
+        "--poll-price-path",
+        metavar="A.B.C",
+        help="Dotted path to the price in the JSON, e.g. data.last or results.0.c",
+    )
+    poll.add_argument(
+        "--poll-volume-path", metavar="A.B.C", help="Optional dotted path to volume."
+    )
+    poll.add_argument(
+        "--poll-every", type=int, default=15, metavar="SECONDS",
+        help="Seconds between quotes (default: 15, minimum 5).",
+    )
+    poll.add_argument(
+        "--poll-header", action="append", default=[], metavar="K:V",
+        help="Extra request header, e.g. an API key. Repeatable.",
+    )
+    poll.add_argument(
+        "--poll-interval-minutes", type=int, default=5,
+        help="Bar size to build from the quotes (default: 5).",
+    )
+
     output = parser.add_argument_group("output")
     output.add_argument("--json", action="store_true", help="Emit JSON instead of a card.")
     output.add_argument("--no-color", action="store_true")
@@ -250,8 +279,8 @@ def load_bars(args: argparse.Namespace) -> list[Bar]:
         bars = fetch_live(args.symbol, args.interval, args.lookback)
     elif args.demo:
         bars = generate_demo_bars()
-    elif args.serve:
-        # Serving without a seed is legal: the series builds from the feed.
+    elif args.serve or args.poll:
+        # Serving or polling without a seed is legal: the series builds itself.
         return []
     else:
         raise DataError("choose a data source: --csv PATH, --live, or --demo")
@@ -756,6 +785,93 @@ def run_server(
 
 
 MIN_WATCH_SECONDS = 5
+MIN_POLL_SECONDS = 5
+
+
+def run_poll(
+    args: argparse.Namespace,
+    spec,
+    state: AccountState,
+    bars: list[Bar],
+    engine: RiskEngine,
+    c: Palette,
+) -> int:
+    """Build bars from a polled quote endpoint and decide as each bar closes.
+
+    One long-lived process, like --watch and for the same reason. Transient
+    fetch failures are reported and retried rather than ending a session you
+    are relying on.
+    """
+    if not args.poll_price_path:
+        raise DataError("--poll requires --poll-price-path")
+
+    headers = {}
+    for raw in args.poll_header:
+        if ":" not in raw:
+            raise DataError(f"bad --poll-header {raw!r}, expected 'Key: Value'")
+        key, value = raw.split(":", 1)
+        headers[key.strip()] = value.strip()
+
+    source = HttpQuoteSource(
+        url=args.poll,
+        price_path=args.poll_price_path,
+        volume_path=args.poll_volume_path,
+        headers=headers,
+    )
+    aggregator = BarAggregator(interval_minutes=args.poll_interval_minutes)
+    every = max(args.poll_every, MIN_POLL_SECONDS)
+
+    print(c("  NQ COPILOT — quote feed", BOLD))
+    print(f"    Polling {c(args.poll, CYAN)} every {every}s")
+    print(f"    Building {args.poll_interval_minutes}m bars from '{args.poll_price_path}'")
+    print(f"    Seeded with {len(bars)} bar(s)")
+    if len(bars) < 80:
+        needed = (80 - len(bars)) * args.poll_interval_minutes
+        print(
+            c(
+                f"    Only {len(bars)} bars seeded — the engine needs ~80, about "
+                f"{needed // 60}h{needed % 60:02d}m of polling from cold. "
+                f"Seed with --csv for an immediate read.",
+                YELLOW,
+            )
+        )
+    print(
+        c(
+            "    A polled quote is not an exchange bar: highs and lows are "
+            "understated and volume is often absent. Fine for tracking the "
+            "session, not equivalent to broker data.",
+            DIM,
+        )
+    )
+    print(c("    Ctrl-C to stop.\n", DIM))
+
+    errors = 0
+    try:
+        while True:
+            try:
+                tick = source.fetch()
+                errors = 0
+            except FeedError as exc:
+                errors += 1
+                print(c(f"  ! {exc} (retry {errors} in {every}s)", YELLOW), file=sys.stderr)
+                _time.sleep(every)
+                continue
+
+            completed = aggregator.add_tick(tick)
+            if completed is not None:
+                bars.append(completed)
+                directive = evaluate(
+                    bars, spec, state, risk=engine,
+                    config=PlaybookConfig(min_score=args.min_score),
+                    in_position=args.in_position,
+                )
+                print("\n" + c(f"── {completed.ts:%H:%M} bar closed ──", DIM))
+                print(render(directive, state, spec, c, args.verbose))
+                if args.state:
+                    save_state(args.state, state)
+            _time.sleep(every)
+    except KeyboardInterrupt:
+        return 130
 
 
 def run_watch(args: argparse.Namespace, c: Palette) -> int:
@@ -819,6 +935,9 @@ def run_once(args: argparse.Namespace, c: Palette) -> int:
     if news_warning:
         print(c(f"  ! {news_warning}", YELLOW, BOLD), file=sys.stderr)
 
+    if args.poll:
+        return run_poll(args, spec, state, bars, engine, c)
+
     if args.serve:
         return run_server(args, spec, state, bars, engine, c)
 
@@ -858,6 +977,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     c = Palette(enabled=not args.no_color and sys.stdout.isatty())
+
+    # Long-running modes are routinely piped to `tee` or a log file. Python
+    # block-buffers a non-tty stdout, so without this a monitor you are
+    # watching live appears to produce nothing for minutes at a time.
+    if args.watch or args.serve or args.poll:
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass  # not a reconfigurable stream; output still lands, just later
 
     try:
         # State-mutating shortcuts run without needing market data.

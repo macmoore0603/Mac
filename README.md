@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 341 tests. A hard rule gate always beats
+These are deterministic and covered by 373 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -252,10 +252,44 @@ exposed by accident, and it refuses oversized bodies without reading them.
 | `--serve` | **Live trading** | TradingView alert webhooks — reads your actual chart. See above. |
 | `--csv` | Live trading, review | Export 5-minute bars from Tradovate / NinjaTrader / TradingView. |
 | `--live` | Learning, after-hours review | Delayed, rate-limits, revises bars. Not for funded decisions. |
+| `--poll` | Live, any quote source | Builds bars from a polled JSON price. See below. |
 | `--demo` | Testing | Deterministic synthetic bars. Means nothing about real performance. |
 
 To wire your broker feed in, produce a `list[Bar]` — that is the entire
 interface, and everything downstream works unchanged.
+
+### Building bars from a quote endpoint
+
+If your source gives a *price* rather than bars — a broker REST API, a polled
+JSON endpoint — `--poll` builds bars from it:
+
+```bash
+nqcopilot --poll "https://your-broker/api/quote/MNQ" \
+          --poll-price-path data.last \
+          --poll-volume-path data.volume \
+          --poll-header "Authorization: Bearer $TOKEN" \
+          --poll-every 15 \
+          --csv seed.csv --state ~/.apex.json
+```
+
+`--poll-price-path` is a dotted path into the JSON (`data.last`,
+`results.0.c`). A bar is emitted only once its interval has fully elapsed, so
+the engine never sees one that can still change.
+
+**Use your broker's API, not a scraped web page.** With an Apex account you
+already have a Tradovate or Rithmic login — that is a licensed, real-time,
+exchange-grade feed included in what you already pay for. A scraped public
+quote is delayed, breaks whenever the page changes, and is usually against the
+site's terms. The adapter works with either; one of them is strictly better.
+
+Two honest limits:
+
+- **A polled quote is not an exchange bar.** You see the price at each poll,
+  not every trade, so highs and lows are understated and volume is often
+  absent. Fine for tracking the live session; not equivalent to broker bars,
+  and not what you want under `--backtest`.
+- **Warmup is real.** The engine needs ~80 bars — nearly seven hours on a
+  5-minute interval from cold. Seed with `--csv` and let the feed extend it.
 
 ### Economic calendar (optional)
 
@@ -502,7 +536,7 @@ bound on quality, never as an expectation.
 ## Testing
 
 ```bash
-python3 -m pytest -q     # 341 tests
+python3 -m pytest -q     # 373 tests
 ```
 
 The suite covers the threshold ratchet and its monotonicity under random mark
@@ -550,6 +584,7 @@ src/nqcopilot/
 ├── backtest.py    Pessimistic bar-by-bar replay and metrics
 ├── calendar.py    Economic-calendar fetch for automatic news blackouts
 ├── webhook.py     TradingView alert receiver (live feed from your chart)
+├── feed.py        Quote-to-bar adapter for any price source
 ├── data.py        CSV / live / demo loaders
 └── cli.py         The decision card
 pine/NQApexCopilot.pine

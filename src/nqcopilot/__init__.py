@@ -34,6 +34,7 @@ from .bars import Bar, Session, classify_session, trading_date
 from .calendar import CalendarError, EconomicEvent, fetch_economic_calendar
 from .contracts import ES, MES, MNQ, NQ, ContractSpec, get_contract
 from .data import generate_demo_bars, load_csv
+from .feed import BarAggregator, FeedError, HttpQuoteSource, Tick
 from .market import IndicatorConfig, MarketContext, Regime
 from .playbook import Action, Directive, PlaybookConfig, evaluate
 from .signals import Setup, detect_all
@@ -50,12 +51,16 @@ __all__ = [
     "BacktestConfig",
     "BacktestResult",
     "Bar",
+    "BarAggregator",
     "BarStore",
     "Blocker",
     "CalendarError",
     "CompletedTrade",
     "ContractSpec",
     "EconomicEvent",
+    "FeedError",
+    "HttpQuoteSource",
+    "Tick",
     "Directive",
     "ES",
     "IndicatorConfig",
