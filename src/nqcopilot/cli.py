@@ -206,7 +206,18 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument("--no-color", action="store_true")
     output.add_argument("--min-score", type=float, default=55.0)
     output.add_argument(
-        "--watch", type=int, metavar="SECONDS", help="Re-evaluate on an interval."
+        "--watch",
+        type=int,
+        metavar="SECONDS",
+        help="Re-evaluate on an interval in ONE long-lived process. Use this "
+        "rather than a shell `while true` loop: relaunching a binary makes the "
+        "OS re-ask for permissions every iteration.",
+    )
+    output.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear the terminal between --watch refreshes. Off by default so "
+        "scrollback, logs and screen recordings stay readable.",
     )
     output.add_argument("--verbose", action="store_true", help="Show rejected candidates.")
 
@@ -711,6 +722,51 @@ def run_server(
     return 0
 
 
+MIN_WATCH_SECONDS = 5
+
+
+def run_watch(args: argparse.Namespace, c: Palette) -> int:
+    """Re-evaluate on an interval inside a single long-lived process.
+
+    Deliberately one process rather than a relaunching shell loop. Beyond being
+    wasteful, repeatedly relaunching a binary makes the operating system treat
+    each iteration as a new program: macOS re-asks for permissions per launch,
+    so a `while true; do …; sleep 5; done` wrapper produces a permission dialog
+    every five seconds. Keeping one process alive asks once.
+
+    A transient failure — a rate-limited quote endpoint, a momentary DNS blip —
+    must not end the session either. Those are reported and retried rather than
+    killing a monitor you are relying on mid-session.
+    """
+    interval = max(args.watch, MIN_WATCH_SECONDS)
+    if interval != args.watch:
+        print(
+            c(
+                f"  Watch interval raised to {interval}s: polling faster adds load "
+                f"without adding information on {args.interval} bars.",
+                DIM,
+            ),
+            file=sys.stderr,
+        )
+
+    consecutive_errors = 0
+    while True:
+        if args.clear:
+            print("\033[2J\033[H", end="")
+        try:
+            run_once(args, c)
+            consecutive_errors = 0
+        except DataError as exc:
+            consecutive_errors += 1
+            print(
+                c(f"  ! {exc} (retry {consecutive_errors} in {interval}s)", YELLOW),
+                file=sys.stderr,
+            )
+        except KeyboardInterrupt:
+            return 130
+        _time.sleep(interval)
+
+
 def run_once(args: argparse.Namespace, c: Palette) -> int:
     spec = get_contract(args.symbol)
     if args.round_turn is not None:
@@ -818,10 +874,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.watch:
-            while True:
-                print("\033[2J\033[H", end="" if c.enabled else "\n")
-                run_once(args, c)
-                _time.sleep(args.watch)
+            return run_watch(args, c)
 
         return run_once(args, c)
 

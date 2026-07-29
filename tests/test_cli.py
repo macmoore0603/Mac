@@ -266,3 +266,82 @@ class TestRendering:
     def test_directive_dict_is_json_serialisable(self):
         directive, state = self._directive()
         json.dumps(directive_to_dict(directive, state))
+
+
+class TestWatchMode:
+    """One long-lived process, resilient to transient failures.
+
+    Relaunching a binary on a timer makes the OS treat each iteration as a new
+    program and re-prompt for permissions, so the loop must stay in-process.
+    """
+
+    def test_interval_is_floored(self, monkeypatch, capsys):
+        from nqcopilot.cli import MIN_WATCH_SECONDS, run_watch
+
+        slept: list[int] = []
+
+        def fake_sleep(seconds):
+            slept.append(seconds)
+            raise KeyboardInterrupt  # stop after one cycle
+
+        monkeypatch.setattr("nqcopilot.cli._time.sleep", fake_sleep)
+        monkeypatch.setattr("nqcopilot.cli.run_once", lambda a, c: 0)
+
+        args = build_parser().parse_args(["--demo", "--watch", "1"])
+        with pytest.raises(KeyboardInterrupt):
+            run_watch(args, PLAIN)
+        assert slept == [MIN_WATCH_SECONDS]
+        assert "raised to" in capsys.readouterr().err
+
+    def test_transient_error_does_not_kill_the_loop(self, monkeypatch, capsys):
+        from nqcopilot.cli import run_watch
+        from nqcopilot.data import DataError
+
+        calls = {"n": 0}
+
+        def flaky(args, c):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise DataError("rate limited")
+            return 0
+
+        def fake_sleep(_):
+            if calls["n"] >= 2:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr("nqcopilot.cli.run_once", flaky)
+        monkeypatch.setattr("nqcopilot.cli._time.sleep", fake_sleep)
+
+        args = build_parser().parse_args(["--demo", "--watch", "5"])
+        with pytest.raises(KeyboardInterrupt):
+            run_watch(args, PLAIN)
+
+        # It survived the failure and ran again rather than exiting.
+        assert calls["n"] == 2
+        assert "rate limited" in capsys.readouterr().err
+
+    def test_does_not_clear_the_screen_by_default(self, monkeypatch, capsys):
+        from nqcopilot.cli import run_watch
+
+        monkeypatch.setattr("nqcopilot.cli.run_once", lambda a, c: 0)
+        monkeypatch.setattr(
+            "nqcopilot.cli._time.sleep",
+            lambda _: (_ for _ in ()).throw(KeyboardInterrupt),
+        )
+        args = build_parser().parse_args(["--demo", "--watch", "5"])
+        with pytest.raises(KeyboardInterrupt):
+            run_watch(args, PLAIN)
+        assert "\033[2J" not in capsys.readouterr().out
+
+    def test_clear_flag_opts_in(self, monkeypatch, capsys):
+        from nqcopilot.cli import run_watch
+
+        monkeypatch.setattr("nqcopilot.cli.run_once", lambda a, c: 0)
+        monkeypatch.setattr(
+            "nqcopilot.cli._time.sleep",
+            lambda _: (_ for _ in ()).throw(KeyboardInterrupt),
+        )
+        args = build_parser().parse_args(["--demo", "--watch", "5", "--clear"])
+        with pytest.raises(KeyboardInterrupt):
+            run_watch(args, PLAIN)
+        assert "\033[2J" in capsys.readouterr().out

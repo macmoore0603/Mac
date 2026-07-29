@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 361 tests. A hard rule gate always beats
+These are deterministic and covered by 333 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -90,7 +90,9 @@ nqcopilot --demo
 # Your real account, bars exported from your platform
 nqcopilot --csv nq_5m.csv --symbol MNQ --balance 51200 --threshold 49200
 
-# Live-ish delayed data, refreshing every minute
+# Live-ish delayed data, refreshing every minute.
+# Use --watch, NOT a shell `while true` loop: relaunching a binary on a timer
+# makes the OS re-ask for permissions on every iteration.
 nqcopilot --live --symbol MNQ --state ~/.nqcopilot.json --watch 60
 
 # Read your actual TradingView chart, live (see below)
@@ -472,7 +474,7 @@ bound on quality, never as an expectation.
 ## Testing
 
 ```bash
-python3 -m pytest -q     # 174 tests
+python3 -m pytest -q     # 333 tests
 ```
 
 The suite covers the threshold ratchet and its monotonicity under random mark
