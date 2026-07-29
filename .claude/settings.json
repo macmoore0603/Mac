@@ -1,15 +1,36 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -m pytest *)",
-      "Bash(python -m pytest *)",
-      "Bash(pytest *)",
-      "Bash(nqcopilot *)",
-      "Bash(python3 -m nqcopilot *)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(pytest:*)",
+      "Bash(pip:*)",
+      "Bash(pip3:*)",
+      "Bash(nqcopilot:*)",
+      "Bash(git:*)",
+      "Bash(curl:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(touch:*)",
+      "Bash(chmod:*)",
+      "Bash(sleep:*)",
+      "Bash(cat:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(jq:*)",
       "mcp__github__pull_request_read",
       "mcp__github__get_job_logs",
       "mcp__github__list_pull_requests",
-      "mcp__github__actions_list"
+      "mcp__github__actions_list",
+      "mcp__github__create_pull_request",
+      "mcp__github__update_pull_request",
+      "mcp__github__add_issue_comment",
+      "mcp__github__get_file_contents",
+      "mcp__github__list_branches",
+      "mcp__github__list_commits"
     ]
   }
 }
