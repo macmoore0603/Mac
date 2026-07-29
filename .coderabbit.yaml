@@ -1,0 +1,8 @@
+# CodeRabbit configuration.
+#
+# The PR is a draft, so CodeRabbit skips review — but it posted a comment
+# saying so on every single push, which turns into a notification each time.
+# This silences the status message without disabling review itself: when the
+# PR is marked ready, CodeRabbit reviews it normally.
+reviews:
+  review_status: false
