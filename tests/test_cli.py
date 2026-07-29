@@ -40,9 +40,11 @@ class TestArgumentParsing:
         args = _args("--demo")
         assert args.symbol == "MNQ"          # micros, not minis
         assert args.profile == "apex50k-pa"
-        assert args.risk_per_trade == 250.0
-        assert args.daily_loss == 600.0
-        assert args.max_trades == 4
+        assert args.style == "conservative"
+        # Dollar limits are derived from the drawdown, not hardcoded.
+        assert args.risk_per_trade is None
+        assert args.daily_loss is None
+        assert args.max_trades is None
 
     def test_rejects_unknown_profile(self):
         with pytest.raises(SystemExit):

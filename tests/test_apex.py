@@ -19,6 +19,7 @@ from nqcopilot.apex import (
     AccountState,
     RiskEngine,
     RiskLimits,
+    RiskStyle,
     ScalingLadder,
     Severity,
     TrailingMode,
@@ -161,7 +162,10 @@ class TestTradeBooking:
 
 class TestSizing:
     def test_size_respects_per_trade_risk_cap(self, fresh_state):
-        engine = RiskEngine(fresh_state, RiskLimits(max_risk_per_trade=200.0))
+        # pct_of_room relaxed so the per-trade cap is the one under test.
+        engine = RiskEngine(
+            fresh_state, RiskLimits(max_risk_per_trade=200.0, max_risk_pct_of_room=1.0)
+        )
         # MNQ at $2/point: a 20pt stop risks $40 + $1.34 commission per contract.
         sizing = engine.size_position(MNQ, 20.0)
         assert sizing.risk_per_contract == pytest.approx(41.34)
@@ -189,14 +193,14 @@ class TestSizing:
     def test_dollar_limits_bind_before_the_contract_cap(self, fresh_state):
         """The tightest constraint wins, and the engine names it.
 
-        With default limits and $2,000 of room, the 10%-of-room cap ($200) binds
-        before the $250 per-trade cap and far before the 100-micro account cap.
-        This ordering is the point of the whole calculation.
+        With conservative defaults on a $2,000 drawdown the per-trade cap is
+        $100 — 5% of the allowance — which binds far before the 100-micro
+        account cap. This ordering is the point of the whole calculation.
         """
         sizing = RiskEngine(fresh_state).size_position(MNQ, 8.0)
-        assert sizing.limiting_factor == "pct_of_room"
-        assert sizing.risk_budget == pytest.approx(200.0)
-        assert sizing.quantity == 11  # floor(200 / 17.34)
+        assert sizing.limiting_factor == "max_risk_per_trade"
+        assert sizing.risk_budget == pytest.approx(100.0)
+        assert sizing.quantity == 5  # floor(100 / 17.34)
         assert sizing.quantity < fresh_state.profile.contract_cap(MNQ)
 
     def test_contract_cap_is_enforced(self, fresh_state):
@@ -654,3 +658,66 @@ class TestScalingLadder:
         state = AccountState.fresh(APEX_50K_INTRADAY)
         assert state.contract_cap(MNQ) == 100  # 10 minis
         assert state.firm_daily_loss_limit() is None
+
+
+class TestRiskStyles:
+    """Limits scaled to the drawdown allowance, not to the account label.
+
+    A $600 daily cap is prudent on a $10,000 buffer and reckless on a $2,000
+    one. Only the ratio makes that visible, so only the ratio is configured.
+    """
+
+    def test_conservative_survives_more_losing_days(self):
+        conservative = RiskLimits.for_drawdown(2_000, RiskStyle.CONSERVATIVE)
+        aggressive = RiskLimits.for_drawdown(2_000, RiskStyle.AGGRESSIVE)
+        assert conservative.days_to_breach(2_000) > aggressive.days_to_breach(2_000)
+        # Roughly a week of full stop-out days versus under three.
+        assert conservative.days_to_breach(2_000) >= 6.0
+        assert aggressive.days_to_breach(2_000) < 3.5
+
+    def test_conservative_defaults_for_a_two_thousand_drawdown(self):
+        limits = RiskLimits.for_drawdown(2_000, RiskStyle.CONSERVATIVE)
+        assert limits.max_risk_per_trade == pytest.approx(100.0)
+        assert limits.daily_loss_limit == pytest.approx(300.0)
+        assert limits.daily_profit_lock == pytest.approx(400.0)
+        assert limits.min_room_to_trade == pytest.approx(500.0)
+        assert limits.threshold_safety_buffer == pytest.approx(200.0)
+        assert limits.max_trades_per_day == 3
+        assert limits.max_consecutive_losses == 2
+
+    def test_limits_scale_with_the_allowance(self):
+        small = RiskLimits.for_drawdown(2_000, RiskStyle.CONSERVATIVE)
+        large = RiskLimits.for_drawdown(10_000, RiskStyle.CONSERVATIVE)
+        assert large.daily_loss_limit == pytest.approx(5 * small.daily_loss_limit)
+        # The survivability is identical, which is the point of scaling.
+        assert large.days_to_breach(10_000) == pytest.approx(small.days_to_breach(2_000))
+
+    def test_styles_are_ordered(self):
+        drawdown = 2_000
+        risks = [
+            RiskLimits.for_drawdown(drawdown, s).max_risk_per_trade
+            for s in (RiskStyle.CONSERVATIVE, RiskStyle.BALANCED, RiskStyle.AGGRESSIVE)
+        ]
+        assert risks == sorted(risks)
+
+    def test_overrides_win(self):
+        limits = RiskLimits.for_drawdown(
+            2_000, RiskStyle.CONSERVATIVE, daily_loss_limit=125.0
+        )
+        assert limits.daily_loss_limit == pytest.approx(125.0)
+        assert limits.max_risk_per_trade == pytest.approx(100.0)  # still derived
+
+    def test_rejects_a_nonpositive_drawdown(self):
+        with pytest.raises(ValueError):
+            RiskLimits.for_drawdown(0)
+
+    def test_days_to_breach_handles_no_limit(self):
+        assert RiskLimits(daily_loss_limit=0.0).days_to_breach(2_000) == float("inf")
+
+    def test_default_limits_are_the_conservative_ones(self):
+        """The out-of-the-box setting must be the safe one, not the middle one."""
+        default = RiskLimits()
+        conservative = RiskLimits.for_drawdown(2_000, RiskStyle.CONSERVATIVE)
+        assert default.max_risk_per_trade == conservative.max_risk_per_trade
+        assert default.daily_loss_limit == conservative.daily_loss_limit
+        assert default.max_trades_per_day == conservative.max_trades_per_day

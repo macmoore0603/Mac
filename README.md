@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 333 tests. A hard rule gate always beats
+These are deterministic and covered by 341 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -307,9 +307,9 @@ working from stale numbers and its guarantees no longer hold.
 |---|---|---|
 | Account breached | equity ≤ threshold | Nothing else matters |
 | Insufficient room | < $400 | Not enough buffer to survive a normal loss |
-| Daily loss limit | −$600 | Self-imposed. Evaluations enforce none; PAs are tier-based (`--firm-daily-loss`) |
-| Daily profit lock | +$900 | Giving back a green day is how accounts stall |
-| Trade count | 4/day | Overtrading is the most common blow-up path |
+| Daily loss limit | −$300 | Self-imposed and derived from your drawdown — see below |
+| Daily profit lock | +$400 | Giving back a green day is how accounts stall |
+| Trade count | 3/day | Overtrading is the most common blow-up path |
 | Loss streak | 2 in a row | You are misreading the session; stop |
 | Stop too tight | < 8 pts | Inside NQ's noise band — a coin flip |
 | Stop too wide | > 60 pts | Not an intraday setup |
@@ -318,6 +318,34 @@ working from stale numbers and its guarantees no longer hold.
 | Opening auction | first 5 min | Spreads wide, range undefined |
 | Lunch | 11:30–13:30 ET | Poor follow-through (soft warning) |
 | News blackout | ±15 min | `--news 08:30`, or `--news-auto` to fetch the schedule |
+
+### Risk limits are derived, not hardcoded
+
+Apex enforces no daily loss limit on most accounts. That is exactly why one is
+essential — and why it is easy to pick a number that *feels* careful and is not.
+A $600 daily stop is prudent against a $10,000 buffer and reckless against a
+$2,000 one; only the ratio makes the difference visible.
+
+So every dollar limit is a fraction of your **drawdown allowance**, selected by
+`--style` (default `conservative`):
+
+| | conservative | balanced | aggressive |
+|---|---|---|---|
+| Risk per trade | 5% | 8% | 12.5% |
+| Daily loss | 15% | 25% | 35% |
+| Trades/day | 3 | 4 | 6 |
+| **Losing days to breach** | **6.7** | **4.0** | **2.9** |
+
+That last row is the number worth staring at, and the card prints it so the
+setting is never abstract:
+
+```
+· Self-imposed daily stop $300.00 — 6.7 full stop-out days would exhaust a
+  $2,000 drawdown (durable). Apex enforces none, so this one is yours to keep.
+```
+
+At `aggressive`, under three bad days ends a funded account. Any individual
+limit can still be pinned with `--risk-per-trade`, `--daily-loss`, etc.
 
 Position size is the **minimum** of every applicable constraint, and the card
 names which one bound. Commission is inside every risk figure — on micros with a
@@ -474,7 +502,7 @@ bound on quality, never as an expectation.
 ## Testing
 
 ```bash
-python3 -m pytest -q     # 333 tests
+python3 -m pytest -q     # 341 tests
 ```
 
 The suite covers the threshold ratchet and its monotonicity under random mark

@@ -259,29 +259,115 @@ PRESETS: dict[str, AccountProfile] = {
 APEX_50K_INTRADAY = APEX_50K_PA
 
 
+class RiskStyle(Enum):
+    """How much of the drawdown allowance a session may consume."""
+
+    CONSERVATIVE = "conservative"
+    BALANCED = "balanced"
+    AGGRESSIVE = "aggressive"
+
+
+# Fractions of the account's *drawdown allowance*, not of its balance. A $50K
+# account with $2,000 of drawdown can survive far less than the balance implies,
+# and limits set against the balance flatter that difference away.
+#
+# The number that matters is how many losing days a style can absorb before the
+# account is gone. At CONSERVATIVE that is roughly six full stop-out days; at
+# AGGRESSIVE it is closer to three, which on a trailing threshold that also
+# ratchets against you is a thin margin.
+_STYLE_FRACTIONS: dict[RiskStyle, dict[str, float]] = {
+    RiskStyle.CONSERVATIVE: {
+        "per_trade": 0.05, "pct_of_room": 0.05, "daily_loss": 0.15,
+        "profit_lock": 0.20, "min_room": 0.25, "buffer": 0.10,
+    },
+    RiskStyle.BALANCED: {
+        "per_trade": 0.08, "pct_of_room": 0.08, "daily_loss": 0.25,
+        "profit_lock": 0.30, "min_room": 0.20, "buffer": 0.08,
+    },
+    RiskStyle.AGGRESSIVE: {
+        "per_trade": 0.125, "pct_of_room": 0.12, "daily_loss": 0.35,
+        "profit_lock": 0.45, "min_room": 0.15, "buffer": 0.05,
+    },
+}
+
+_STYLE_COUNTS: dict[RiskStyle, tuple[int, int]] = {
+    # (max trades per day, max consecutive losses)
+    RiskStyle.CONSERVATIVE: (3, 2),
+    RiskStyle.BALANCED: (4, 3),
+    RiskStyle.AGGRESSIVE: (6, 3),
+}
+
+
 @dataclass(frozen=True)
 class RiskLimits:
     """Self-imposed limits. Apex sets almost none of these; survival requires them.
 
-    Apex imposes no daily loss limit, which is precisely why one is essential:
-    without it a single bad session can consume a threshold that took weeks to
-    build. Defaults are deliberately conservative for a $50K account.
+    Apex enforces no daily loss limit during evaluation and, on many accounts,
+    none at all. That is precisely why one is essential: without it a single bad
+    session can consume a threshold that took weeks to build.
+
+    The defaults here are calibrated for a $2,000 drawdown. Prefer
+    `RiskLimits.for_drawdown`, which scales every dollar figure to the account's
+    actual allowance — a fixed $600 daily cap is prudent on a $10,000 buffer and
+    reckless on a $2,000 one, and only the ratio makes that visible.
     """
 
-    max_risk_per_trade: float = 250.0
-    max_risk_pct_of_room: float = 0.10   # never stake >10% of remaining room
-    daily_loss_limit: float = 600.0
-    daily_profit_lock: float | None = 900.0  # bank the day after this much
-    max_trades_per_day: int = 4
+    max_risk_per_trade: float = 100.0
+    max_risk_pct_of_room: float = 0.05   # never stake >5% of remaining room
+    daily_loss_limit: float = 300.0
+    daily_profit_lock: float | None = 400.0  # bank the day after this much
+    max_trades_per_day: int = 3
     max_consecutive_losses: int = 2
-    min_room_to_trade: float = 400.0
-    threshold_safety_buffer: float = 150.0   # never plan into the threshold itself
+    min_room_to_trade: float = 500.0
+    threshold_safety_buffer: float = 200.0   # never plan into the threshold itself
     max_contracts_override: int | None = None
     min_stop_points: float = 8.0    # NQ noise floor; tighter stops are coin flips
     max_stop_points: float = 60.0   # beyond this the setup is not intraday
     block_lunch: bool = True
     block_first_minutes: float = 5.0    # let the opening auction settle
     news_blackout_minutes: float = 15.0
+
+    @classmethod
+    def for_drawdown(
+        cls,
+        drawdown: float,
+        style: RiskStyle = RiskStyle.CONSERVATIVE,
+        **overrides,
+    ) -> "RiskLimits":
+        """Scale every dollar limit to the account's drawdown allowance.
+
+        Args:
+            drawdown: The account's total drawdown allowance (e.g. $2,000).
+            style: How much of it a session may consume.
+            overrides: Any field to pin explicitly, bypassing the calculation.
+        """
+        if drawdown <= 0:
+            raise ValueError("drawdown must be positive")
+        fractions = _STYLE_FRACTIONS[style]
+        trades, streak = _STYLE_COUNTS[style]
+
+        derived = {
+            "max_risk_per_trade": round(drawdown * fractions["per_trade"], 2),
+            "max_risk_pct_of_room": fractions["pct_of_room"],
+            "daily_loss_limit": round(drawdown * fractions["daily_loss"], 2),
+            "daily_profit_lock": round(drawdown * fractions["profit_lock"], 2),
+            "min_room_to_trade": round(drawdown * fractions["min_room"], 2),
+            "threshold_safety_buffer": round(drawdown * fractions["buffer"], 2),
+            "max_trades_per_day": trades,
+            "max_consecutive_losses": streak,
+        }
+        derived.update(overrides)
+        return cls(**derived)
+
+    def days_to_breach(self, drawdown: float) -> float:
+        """Losing days at the full daily limit before the account is gone.
+
+        The single most useful sanity check on a risk setting, and the one most
+        traders never compute. Below about four, one bad week ends the account.
+        """
+        if self.daily_loss_limit <= 0:
+            return float("inf")
+        return drawdown / self.daily_loss_limit
 
 
 class Severity(Enum):

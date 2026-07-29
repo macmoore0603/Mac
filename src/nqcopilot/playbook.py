@@ -132,6 +132,9 @@ def evaluate_context(
     regime = ctx.regime()
 
     notes = _account_notes(state)
+    budget_note = _risk_budget_note(state, engine)
+    if budget_note:
+        notes.append(budget_note)
     consistency = consistency_status(state)
 
     # 1. Warmup. Without a full indicator stack, every downstream read is noise.
@@ -394,6 +397,28 @@ def _execution_notes(
         )
 
     return notes
+
+
+def _risk_budget_note(state: AccountState, engine: RiskEngine) -> str | None:
+    """State how many losing days the current settings can absorb.
+
+    Apex enforces no daily loss limit on most accounts, so this one is entirely
+    self-imposed — which makes it easy to set a number that feels careful and
+    is not. Expressing it as days-to-breach is the check that makes a limit
+    concrete, and it is the calculation most traders never do.
+    """
+    limits = engine.limits
+    drawdown = state.profile.drawdown_amount
+    if limits.daily_loss_limit <= 0 or drawdown <= 0:
+        return None
+
+    days = limits.days_to_breach(drawdown)
+    verdict = "thin" if days < 4 else "workable" if days < 6 else "durable"
+    return (
+        f"Self-imposed daily stop ${limits.daily_loss_limit:,.2f} — "
+        f"{days:.1f} full stop-out days would exhaust a ${drawdown:,.0f} "
+        f"drawdown ({verdict}). Apex enforces none, so this one is yours to keep."
+    )
 
 
 def _account_notes(state: AccountState) -> list[str]:

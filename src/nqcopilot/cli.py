@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .apex import (
     PRESETS,
+    RiskStyle,
     ScalingLadder,
     AccountState,
     RiskEngine,
@@ -133,10 +134,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     risk = parser.add_argument_group("risk limits")
-    risk.add_argument("--risk-per-trade", type=float, default=250.0)
-    risk.add_argument("--daily-loss", type=float, default=600.0)
-    risk.add_argument("--daily-target", type=float, default=900.0)
-    risk.add_argument("--max-trades", type=int, default=4)
+    risk.add_argument(
+        "--style",
+        default="conservative",
+        choices=[s.value for s in RiskStyle],
+        help="How much of your drawdown allowance a session may consume "
+        "(default: conservative). Every dollar limit below is derived from it "
+        "unless you set the flag explicitly.",
+    )
+    risk.add_argument(
+        "--risk-per-trade", type=float,
+        help="Override the derived per-trade risk cap ($).",
+    )
+    risk.add_argument(
+        "--daily-loss", type=float,
+        help="Override the derived daily loss limit ($). Self-imposed — Apex "
+        "enforces none on most accounts, which is exactly why you need one.",
+    )
+    risk.add_argument(
+        "--daily-target", type=float,
+        help="Override the derived daily profit lock ($). 0 disables it.",
+    )
+    risk.add_argument("--max-trades", type=int, help="Override the derived trade cap.")
     risk.add_argument("--max-contracts", type=int, help="Override the account contract cap.")
     risk.add_argument("--round-turn", type=float, help="Override round-turn commission.")
     risk.add_argument(
@@ -381,13 +400,27 @@ def collect_news(
 def build_risk(
     args: argparse.Namespace, state: AccountState, news_times: list[datetime] | None = None
 ) -> RiskEngine:
-    limits = RiskLimits(
-        max_risk_per_trade=args.risk_per_trade,
-        daily_loss_limit=args.daily_loss,
-        daily_profit_lock=args.daily_target if args.daily_target > 0 else None,
-        max_trades_per_day=args.max_trades,
-        max_contracts_override=args.max_contracts,
-        block_lunch=not args.allow_lunch,
+    """Derive limits from the account's drawdown, then apply explicit overrides.
+
+    Scaling to the drawdown rather than hardcoding dollars is what makes
+    "conservative" mean the same thing on a $2,000 allowance as on a $10,000
+    one. A fixed daily cap silently changes meaning with account size.
+    """
+    style = RiskStyle(args.style)
+    overrides: dict = {"max_contracts_override": args.max_contracts,
+                       "block_lunch": not args.allow_lunch}
+
+    if args.risk_per_trade is not None:
+        overrides["max_risk_per_trade"] = args.risk_per_trade
+    if args.daily_loss is not None:
+        overrides["daily_loss_limit"] = args.daily_loss
+    if args.daily_target is not None:
+        overrides["daily_profit_lock"] = args.daily_target if args.daily_target > 0 else None
+    if args.max_trades is not None:
+        overrides["max_trades_per_day"] = args.max_trades
+
+    limits = RiskLimits.for_drawdown(
+        state.profile.drawdown_amount, style=style, **overrides
     )
     return RiskEngine(state, limits, news_times or [])
 
