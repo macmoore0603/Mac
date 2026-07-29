@@ -1,0 +1,413 @@
+//@version=6
+// =============================================================================
+// NQ Apex Copilot — intraday Nasdaq decision support with Apex risk arithmetic
+// =============================================================================
+//
+// Mirrors the logic of the Python `nqcopilot` engine so the chart and the CLI
+// agree: same EMAs, same Wilder ATR/ADX, same session VWAP with volume-weighted
+// bands, same regime gate, same five setups, same position sizing.
+//
+// What this does NOT do: predict. Every setup below is a conditional pattern
+// with a modest historical edge, and each one loses regularly. The part that is
+// exact is the risk panel — drawdown room, size, and the threshold arithmetic.
+//
+// Setup on TradingView:
+//   1. Chart MNQ1! or NQ1! on a 5-minute candle chart.
+//   2. Set the chart timezone to New York.
+//   3. Open Settings and enter your REAL balance and threshold from the Apex
+//      dashboard. Defaults are placeholders and sizing is wrong until you do.
+// =============================================================================
+
+indicator("NQ Apex Copilot", shorttitle="NQ COPILOT", overlay = true, max_labels_count = 100)
+
+// ---------------------------------------------------------------- inputs ----
+grpAcct = "Account (copy from your Apex dashboard)"
+inBalance    = input.float(50000.0, "Account balance ($)",        group = grpAcct, step = 100)
+inThreshold  = input.float(48000.0, "Trailing threshold ($)",     group = grpAcct, step = 100,
+     tooltip = "The live threshold Apex shows you — NOT balance minus drawdown, once it has trailed. " +
+     "A $50K starts at $48,000 ($2,000 drawdown).")
+inLock       = input.float(50100.0, "Threshold lock level ($)",   group = grpAcct, step = 100,
+     tooltip = "Starting balance + $100, where the threshold stops trailing permanently. " +
+     "This is also the safety net: only profit above it is withdrawable.")
+inMaxCon     = input.int(10,        "Max contracts (minis)",      group = grpAcct, minval = 1,
+     tooltip = "PA contract limits are tier-based. Set this from your current tier.")
+inFirmDaily  = input.float(0.0,     "Firm daily loss limit ($)",  group = grpAcct, step = 50,
+     tooltip = "Your PA tier's daily loss limit. 0 disables (evaluations enforce none). " +
+     "This is a firm rule that ends the account, unlike the self-imposed limit below.")
+
+grpRisk = "Risk limits (self-imposed — Apex sets almost none)"
+inRiskTrade  = input.float(250.0, "Max risk per trade ($)",       group = grpRisk, step = 25)
+inPctRoom    = input.float(10.0,  "Max % of drawdown room",       group = grpRisk, step = 1)
+inDailyLoss  = input.float(600.0, "Daily loss limit ($)",         group = grpRisk, step = 50)
+inBuffer     = input.float(150.0, "Threshold safety buffer ($)",  group = grpRisk, step = 25)
+inMinStop    = input.float(8.0,   "Min stop (points)",            group = grpRisk, step = 1)
+inMaxStop    = input.float(60.0,  "Max stop (points)",            group = grpRisk, step = 5)
+
+grpCon = "Contract"
+inSymbol     = input.string("MNQ", "Contract", options = ["MNQ", "NQ"], group = grpCon)
+inRoundTurn  = input.float(1.34,  "Round-turn commission ($)",    group = grpCon, step = 0.01)
+
+grpSig = "Signals"
+inMinScore   = input.float(55.0, "Minimum setup score (0-100)", group = grpSig, step = 5)
+inMinNetR    = input.float(1.2,  "Minimum net R to target 1",   group = grpSig, step = 0.1)
+inBlockLunch = input.bool(true,  "Block lunch (11:30-13:30 ET)", group = grpSig)
+inShowZones  = input.bool(true,  "Shade regime background",      group = grpSig)
+
+grpHook = "Webhook (feed your chart to the copilot)"
+inWebhook       = input.bool(false, "Emit bar payload on every close", group = grpHook,
+     tooltip = "Turn on, then create an alert with condition 'Any alert() function call' and " +
+     "point its webhook URL at your running `nqcopilot --serve`. TradingView will POST each " +
+     "closed bar from THIS chart, so the copilot reads exactly what you see.")
+inWebhookSecret = input.string("", "Shared secret", group = grpHook,
+     tooltip = "Must match --secret on the server. Rejects posts from anyone else.")
+
+grpInd = "Indicators"
+inEmaFast = input.int(9,   "EMA fast",   group = grpInd, minval = 1)
+inEmaMid  = input.int(21,  "EMA mid",    group = grpInd, minval = 1)
+inEmaSlow = input.int(50,  "EMA slow",   group = grpInd, minval = 1)
+inAtrLen  = input.int(14,  "ATR length", group = grpInd, minval = 1)
+inAdxLen  = input.int(14,  "ADX length", group = grpInd, minval = 1)
+inPivotL  = input.int(3,   "Pivot left", group = grpInd, minval = 1)
+inPivotR  = input.int(3,   "Pivot right",group = grpInd, minval = 1)
+
+// ------------------------------------------------------------ indicators ----
+TZ = "America/New_York"
+
+emaF = ta.ema(close, inEmaFast)
+emaM = ta.ema(close, inEmaMid)
+emaS = ta.ema(close, inEmaSlow)
+atrV = ta.atr(inAtrLen)
+rsiV = ta.rsi(close, 14)
+[diPlus, diMinus, adxV] = ta.dmi(inAdxLen, inAdxLen)
+
+// Session VWAP with volume-weighted standard-deviation bands, matching the
+// Python engine's `session_vwap`.
+[vwapV, vwapU1, vwapL1] = ta.vwap(hlc3, timeframe.change("D"), 1.0)
+[_v2,   vwapU2, vwapL2] = ta.vwap(hlc3, timeframe.change("D"), 2.0)
+
+atrRank = ta.percentrank(atrV, 100)
+relVol  = volume / math.max(ta.sma(volume, 20), 1)
+
+// Higher-timeframe trend, closed bars only (lookahead_off is the default and is
+// what makes this safe to act on).
+htfClose = request.security(syminfo.tickerid, "15", close[1], lookahead = barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, "15", ta.ema(close, 21)[1], lookahead = barmerge.lookahead_off)
+htfBias  = htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+
+// Prior-day levels, again from completed data only.
+pdHigh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+pdLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+
+// Confirmed swing pivots. ta.pivothigh returns a value only once the right-hand
+// bars exist, so `lastPH`/`lastPL` are never known before they are real.
+ph = ta.pivothigh(high, inPivotL, inPivotR)
+pl = ta.pivotlow(low,  inPivotL, inPivotR)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ---------------------------------------------------------------- clock -----
+inOpeningRange = not na(time(timeframe.period, "0930-1000", TZ))
+inRTH          = not na(time(timeframe.period, "0930-1600", TZ))
+inLunch        = not na(time(timeframe.period, "1130-1330", TZ))
+inOpenDrive    = not na(time(timeframe.period, "0930-1000", TZ))
+inMorning      = not na(time(timeframe.period, "1000-1130", TZ))
+inPowerHour    = not na(time(timeframe.period, "1500-1550", TZ))
+inCloseOut     = not na(time(timeframe.period, "1550-1600", TZ))
+inHalt         = not na(time(timeframe.period, "1700-1800", TZ))
+
+sessionOpen  = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 9, 30)
+minsSinceOpen = (time - sessionOpen) / 60000.0
+
+// Opening range, rebuilt each day.
+var float orHigh = na
+var float orLow  = na
+if timeframe.change("D")
+    orHigh := na
+    orLow  := na
+if inOpeningRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+orComplete = not inOpeningRange and not na(orHigh) and inRTH
+orWidth    = na(orHigh) or na(orLow) ? na : orHigh - orLow
+
+// --------------------------------------------------------------- regime -----
+emaStack = emaF > emaM and emaM > emaS ? 1 : emaF < emaM and emaM < emaS ? -1 : 0
+
+regime = atrRank >= 90 ? "EXPANSION" :
+         atrRank <= 15 ? "QUIET" :
+         adxV >= 23 and diPlus > diMinus and emaStack >= 0 ? "TREND UP" :
+         adxV >= 23 and diMinus > diPlus and emaStack <= 0 ? "TREND DOWN" :
+         "CHOP"
+
+isTrendUp   = regime == "TREND UP"
+isTrendDown = regime == "TREND DOWN"
+isRange     = regime == "CHOP" or regime == "QUIET"
+
+// ----------------------------------------------------------- confluence -----
+// Mirrors `_confluence` in signals.py. Scores context support for a direction.
+confluence(int dir) =>
+    float pts = 0.0
+    pts += htfBias == dir ? 15 : htfBias == -dir ? -12 : 0
+    pts += emaStack == dir ? 10 : emaStack == -dir ? -8 : 0
+    onVwapSide = dir > 0 ? close > vwapV : close < vwapV
+    pts += onVwapSide ? 10 : -6
+    pts += math.max(0, math.min(15, (adxV - 15) * 0.9))
+    pts += relVol >= 1.3 ? 10 : relVol < 0.7 ? -8 : 0
+    pts += (inOpenDrive or inMorning) ? 10 : inLunch ? -15 : inPowerHour ? 5 : 0
+    extended = dir > 0 ? rsiV > 78 : rsiV < 22
+    pts += extended ? -10 : 0
+    pts
+
+closePos = high == low ? 0.5 : (close - low) / (high - low)
+
+// ------------------------------------------------------------- setups -------
+// 1. Trend pullback — highest-expectancy intraday structure on NQ.
+pulledBackLong  = ta.lowest(low, 3)  <= math.max(emaM, vwapV) + 0.35 * atrV
+pulledBackShort = ta.highest(high, 3) >= math.min(emaM, vwapV) - 0.35 * atrV
+tpLong  = isTrendUp   and pulledBackLong  and close > open and closePos >= 0.6 and close > emaM
+tpShort = isTrendDown and pulledBackShort and close < open and closePos <= 0.4 and close < emaM
+
+// 2. Opening range breakout — first accepted close outside a complete range.
+orbValid  = orComplete and not na(orWidth) and orWidth <= 3.0 * atrV and orWidth >= 0.4 * atrV
+     and minsSinceOpen >= 30 and minsSinceOpen <= 180 and not isRange
+orbLong  = orbValid and close > orHigh and close[1] <= orHigh and closePos >= 0.55
+orbShort = orbValid and close < orLow  and close[1] >= orLow  and closePos <= 0.45
+
+// 3. VWAP reclaim — the session's balance point changes hands.
+belowCount = math.sum(close < vwapV ? 1 : 0, 6)
+aboveCount = math.sum(close > vwapV ? 1 : 0, 6)
+vrLong  = regime != "EXPANSION" and belowCount[1] >= 4 and close > vwapV and close > open
+vrShort = regime != "EXPANSION" and aboveCount[1] >= 4 and close < vwapV and close < open
+
+// 4. Failed breakout — a poke through a prior-day extreme that does not hold.
+fbShort = not na(pdHigh) and ta.highest(high, 4) > pdHigh and close < pdHigh and close < open
+fbLong  = not na(pdLow)  and ta.lowest(low, 4)   < pdLow  and close > pdLow  and close > open
+
+// 5. VWAP fade — range regimes only. Fading a real trend is account suicide.
+sigma      = (close - vwapV) / math.max(vwapU1 - vwapV, syminfo.mintick)
+fadeShort  = isRange and sigma >= 2.0 and rsiV > 62 and (high - math.max(open, close)) > math.abs(close - open) * 0.8
+fadeLong   = isRange and sigma <= -2.0 and rsiV < 38 and (math.min(open, close) - low) > math.abs(close - open) * 0.8
+
+// ------------------------------------------------- pick the best candidate ---
+// Setups are ranked by total score, matching DETECTORS in the Python engine.
+// Selection is written out at global scope because a Pine function cannot
+// assign to a global — the comparisons must live here.
+scoreLong  = confluence(1)
+scoreShort = confluence(-1)
+
+var string setupName  = ""
+var int    setupDir   = 0
+var float  setupScore = 0.0
+
+setupName  := ""
+setupDir   := 0
+setupScore := -1000.0
+
+if tpLong and scoreLong + 22 > setupScore
+    setupName  := "Trend Pullback"
+    setupDir   := 1
+    setupScore := scoreLong + 22
+if tpShort and scoreShort + 22 > setupScore
+    setupName  := "Trend Pullback"
+    setupDir   := -1
+    setupScore := scoreShort + 22
+if orbLong and scoreLong + 25 > setupScore
+    setupName  := "Opening Range Breakout"
+    setupDir   := 1
+    setupScore := scoreLong + 25
+if orbShort and scoreShort + 25 > setupScore
+    setupName  := "Opening Range Breakout"
+    setupDir   := -1
+    setupScore := scoreShort + 25
+if vrLong and scoreLong + 15 > setupScore
+    setupName  := "VWAP Reclaim"
+    setupDir   := 1
+    setupScore := scoreLong + 15
+if vrShort and scoreShort + 15 > setupScore
+    setupName  := "VWAP Reclaim"
+    setupDir   := -1
+    setupScore := scoreShort + 15
+if fbLong and scoreLong + 18 > setupScore
+    setupName  := "Failed Breakout"
+    setupDir   := 1
+    setupScore := scoreLong + 18
+if fbShort and scoreShort + 18 > setupScore
+    setupName  := "Failed Breakout"
+    setupDir   := -1
+    setupScore := scoreShort + 18
+if fadeLong and scoreLong + 12 > setupScore
+    setupName  := "VWAP Fade"
+    setupDir   := 1
+    setupScore := scoreLong + 12
+if fadeShort and scoreShort + 12 > setupScore
+    setupName  := "VWAP Fade"
+    setupDir   := -1
+    setupScore := scoreShort + 12
+
+hasSetup = setupDir != 0
+
+// ------------------------------------------------------- trade geometry -----
+isLong     = setupDir > 0
+structural = isLong ? (na(lastPL) ? ta.lowest(low, 10) : math.min(lastPL, ta.lowest(low, 10)))
+                    : (na(lastPH) ? ta.highest(high, 10) : math.max(lastPH, ta.highest(high, 10)))
+rawStop    = isLong ? structural - 0.25 * atrV : structural + 0.25 * atrV
+
+entryPx    = close
+stopPx     = hasSetup ? rawStop : na
+stopPts    = hasSetup ? math.abs(entryPx - stopPx) : na
+target1    = hasSetup ? entryPx + stopPts * 1.5 * setupDir : na
+target2    = hasSetup ? entryPx + stopPts * 3.0 * setupDir : na
+
+// -------------------------------------------------------------- sizing ------
+pointValue      = inSymbol == "NQ" ? 20.0 : 2.0
+contractCap     = inSymbol == "NQ" ? inMaxCon : inMaxCon * 10
+equity          = inBalance
+threshold       = math.min(inThreshold, inLock)
+room            = equity - threshold
+riskPerContract = na(stopPts) ? na : stopPts * pointValue + inRoundTurn
+
+// The tightest constraint decides size. A firm daily loss limit, when set,
+// binds alongside the self-imposed one.
+dailyBudget = inFirmDaily > 0 ? math.min(inDailyLoss, inFirmDaily) : inDailyLoss
+budget = math.min(inRiskTrade, math.min(room * inPctRoom / 100.0,
+     math.min(math.max(0, room - inBuffer), dailyBudget)))
+qtyRaw = na(riskPerContract) or riskPerContract <= 0 ? 0 : math.floor(budget / riskPerContract)
+qty    = math.max(0, math.min(qtyRaw, contractCap))
+
+grossWin  = na(stopPts) ? na : math.abs(target1 - entryPx) * pointValue * math.max(qty, 1)
+grossLoss = na(stopPts) ? na : stopPts * pointValue * math.max(qty, 1)
+commish   = inRoundTurn * math.max(qty, 1)
+netR      = na(stopPts) ? na : (grossWin - commish) / (grossLoss + commish)
+
+// ---------------------------------------------------------- rule gates ------
+// These are absolute. A high score never overrides one.
+blockBreached  = equity <= threshold
+blockRoom      = room < 400
+blockStopTight = hasSetup and stopPts < inMinStop
+blockStopWide  = hasSetup and stopPts > inMaxStop
+blockSize      = hasSetup and qty < 1
+blockLunchNow  = inBlockLunch and inLunch
+blockCloseOut  = inCloseOut
+blockHalt      = inHalt or not inRTH
+blockScore     = hasSetup and setupScore < inMinScore
+blockNetR      = hasSetup and not na(netR) and netR < inMinNetR
+
+hardBlocked = blockBreached or blockRoom or blockStopTight or blockStopWide
+     or blockSize or blockCloseOut or blockHalt
+
+blockReason = blockBreached  ? "ACCOUNT BREACHED"           :
+              blockHalt      ? "Outside RTH"                :
+              blockCloseOut  ? "Close-out window"           :
+              blockRoom      ? "Drawdown room too thin"     :
+              blockStopTight ? "Stop inside the noise band" :
+              blockStopWide  ? "Stop too wide for intraday" :
+              blockSize      ? "Size rounds to zero"        :
+              blockLunchNow  ? "Lunch chop"                 :
+              blockScore     ? "Score below threshold"      :
+              blockNetR      ? "Net R too low after fees"   : ""
+
+goLong  = hasSetup and isLong      and not hardBlocked and not blockLunchNow and not blockScore and not blockNetR
+goShort = hasSetup and not isLong  and not hardBlocked and not blockLunchNow and not blockScore and not blockNetR
+
+// ---------------------------------------------------------------- plots -----
+plot(emaF, "EMA fast", color.new(color.aqua, 30), 1)
+plot(emaM, "EMA mid",  color.new(color.orange, 20), 2)
+plot(emaS, "EMA slow", color.new(color.gray, 30), 2)
+plot(vwapV, "VWAP", color.new(color.yellow, 0), 2)
+u2 = plot(vwapU2, "VWAP +2σ", color.new(color.purple, 60), 1)
+l2 = plot(vwapL2, "VWAP -2σ", color.new(color.purple, 60), 1)
+fill(u2, l2, color.new(color.purple, 94), "VWAP band")
+
+plot(orComplete ? orHigh : na, "OR high", color.new(color.blue, 20), 2, plot.style_linebr)
+plot(orComplete ? orLow  : na, "OR low",  color.new(color.blue, 20), 2, plot.style_linebr)
+plot(pdHigh, "Prior day high", color.new(color.maroon, 40), 1, plot.style_circles)
+plot(pdLow,  "Prior day low",  color.new(color.maroon, 40), 1, plot.style_circles)
+
+bgcolor(not inShowZones ? na :
+     isTrendUp   ? color.new(color.green, 94) :
+     isTrendDown ? color.new(color.red, 94)   :
+     regime == "EXPANSION" ? color.new(color.orange, 92) :
+     inLunch ? color.new(color.gray, 95) : na, title = "Regime")
+
+plotshape(goLong,  "GO LONG",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(goShort, "GO SHORT", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.small)
+
+// Show a setup that fired but was rejected, so the filter is visible rather
+// than silent — seeing what was declined is how you learn to trust it.
+plotshape(hasSetup and not goLong and not goShort, "Filtered", shape.xcross, location.top,
+     color.new(color.gray, 55), size = size.tiny)
+
+// --------------------------------------------------------------- panel ------
+var table panel = table.new(position.top_right, 2, 12, bgcolor = color.new(color.black, 15),
+     border_width = 1, border_color = color.new(color.gray, 50))
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(panel, 0, r, k, text_color = color.new(color.gray, 20), text_size = size.small,
+         text_halign = text.align_left)
+    table.cell(panel, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+if barstate.islast
+    actionTxt = goLong ? "GO LONG" : goShort ? "GO SHORT" :
+         hardBlocked ? "STAND DOWN" : hasSetup ? "FILTERED" : "WAIT"
+    actionCol = goLong ? color.lime : goShort ? color.red :
+         hardBlocked ? color.gray : color.orange
+
+    f_row(0, "ACTION", actionTxt, actionCol)
+    f_row(1, "Setup", hasSetup ? setupName + " (" + str.tostring(setupScore, "#") + ")" : "—", color.white)
+    f_row(2, "Regime", regime, color.aqua)
+    f_row(3, "Reason", blockReason == "" ? "clear" : blockReason,
+         blockReason == "" ? color.lime : color.orange)
+
+    f_row(4, "Entry",  hasSetup ? str.tostring(entryPx, format.mintick) : "—", color.white)
+    f_row(5, "Stop",   hasSetup ? str.tostring(stopPx, format.mintick) + "  (" + str.tostring(stopPts, "#.##") + "pt)" : "—", color.red)
+    f_row(6, "Target 1", hasSetup ? str.tostring(target1, format.mintick) : "—", color.lime)
+    f_row(7, "Target 2", hasSetup ? str.tostring(target2, format.mintick) : "—", color.lime)
+
+    f_row(8, "Size", (goLong or goShort) ? str.tostring(qty) + " " + inSymbol : "0", color.yellow)
+    f_row(9, "Risk", hasSetup and qty > 0 ?
+         "$" + str.tostring(stopPts * pointValue * qty + commish, "#.##") : "—", color.red)
+    f_row(10, "Net R to T1", na(netR) ? "—" : str.tostring(netR, "#.##"), color.white)
+    f_row(11, "Room left", "$" + str.tostring(room, "#") +
+         (equity <= threshold ? "  BREACHED" : ""), room < 500 ? color.red : color.white)
+
+// --------------------------------------------------------------- alerts -----
+alertcondition(goLong,  "NQ Copilot: LONG",  "NQ Copilot LONG — check the panel for entry, stop and size.")
+alertcondition(goShort, "NQ Copilot: SHORT", "NQ Copilot SHORT — check the panel for entry, stop and size.")
+alertcondition(blockBreached, "NQ Copilot: BREACH RISK", "Equity is at or below the trailing threshold.")
+
+// Human-readable signal alert. Use this when you only want to be told to trade.
+if (goLong or goShort) and not inWebhook
+    alert((goLong ? "GO LONG " : "GO SHORT ") + str.tostring(qty) + " " + inSymbol +
+         " @ " + str.tostring(entryPx, format.mintick) +
+         " | stop " + str.tostring(stopPx, format.mintick) +
+         " | T1 " + str.tostring(target1, format.mintick) +
+         " | " + setupName + " (" + str.tostring(setupScore, "#") + "/100)",
+         alert.freq_once_per_bar_close)
+
+// Machine-readable bar payload. Fires on EVERY bar close so the copilot receives
+// a continuous series from this chart rather than only the signal bars.
+//
+// `time` is sent as epoch milliseconds deliberately: building an ISO-8601 string
+// inside Pine requires escaping the literal 'T', and a malformed timestamp would
+// corrupt the bar series silently. A plain integer cannot be misread.
+if inWebhook
+    payload = '{"secret":"' + inWebhookSecret + '"' +
+         ',"symbol":"'   + syminfo.tickerid + '"' +
+         ',"interval":"' + timeframe.period + '"' +
+         ',"time":'      + str.tostring(time, "#") +
+         ',"open":'      + str.tostring(open) +
+         ',"high":'      + str.tostring(high) +
+         ',"low":'       + str.tostring(low) +
+         ',"close":'     + str.tostring(close) +
+         ',"volume":'    + str.tostring(nz(volume, 0), "#.##") +
+         ',"tv_action":"' + (goLong ? "GO LONG" : goShort ? "GO SHORT" :
+              hardBlocked ? "STAND DOWN" : hasSetup ? "FILTERED" : "WAIT") + '"' +
+         ',"tv_setup":"' + (hasSetup ? setupName : "") + '"' +
+         ',"tv_score":' + str.tostring(hasSetup ? setupScore : 0, "#") +
+         ',"tv_regime":"' + regime + '"' +
+         '}'
+    alert(payload, alert.freq_once_per_bar_close)

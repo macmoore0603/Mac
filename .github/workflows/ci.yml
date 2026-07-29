@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      # The unit tests exercise the library; these confirm the thing a trader
+      # actually runs still starts and produces output.
+      - name: Smoke test the decision card
+        run: nqcopilot --demo --symbol MNQ --no-color
+
+      - name: Smoke test the replay harness
+        run: nqcopilot --demo --symbol MNQ --backtest --trades --no-color
+
+      - name: Smoke test JSON output
+        run: nqcopilot --demo --symbol MNQ --json > /dev/null
