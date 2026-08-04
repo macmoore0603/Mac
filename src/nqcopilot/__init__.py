@@ -37,6 +37,7 @@ from .data import generate_demo_bars, load_csv
 from .feed import BarAggregator, FeedError, HttpQuoteSource, Tick
 from .market import IndicatorConfig, MarketContext, Regime
 from .playbook import Action, Directive, PlaybookConfig, evaluate
+from .sierra import IntradayRecord, ScidError, ScidInfo, iter_records, read_scid, scid_info
 from .signals import Setup, detect_all
 from .webhook import BarStore, WebhookConfig, WebhookContext, WebhookServer
 
@@ -64,6 +65,7 @@ __all__ = [
     "Directive",
     "ES",
     "IndicatorConfig",
+    "IntradayRecord",
     "MES",
     "MNQ",
     "MarketContext",
@@ -82,6 +84,8 @@ __all__ = [
     "WebhookServer",
     "ScalingLadder",
     "ScalingTier",
+    "ScidError",
+    "ScidInfo",
     "Sizing",
     "TrailingMode",
     "classify_session",
@@ -92,8 +96,11 @@ __all__ = [
     "fetch_economic_calendar",
     "generate_demo_bars",
     "get_contract",
+    "iter_records",
     "load_csv",
+    "read_scid",
     "run_backtest",
+    "scid_info",
     "trading_date",
     "__version__",
 ]

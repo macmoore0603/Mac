@@ -38,3 +38,20 @@ jobs:
 
       - name: Smoke test JSON output
         run: nqcopilot --demo --symbol MNQ --json > /dev/null
+
+      # Real .scid files run to gigabytes, so there is no fixture in the repo;
+      # the smoke test builds a small one and reads it back through the CLI.
+      - name: Smoke test the Sierra Chart reader
+        run: |
+          python -c "
+          from datetime import datetime, timedelta
+          from nqcopilot.bars import ET
+          from nqcopilot.sierra import make_tick_record, write_scid
+          base = datetime(2026, 7, 27, 9, 30, tzinfo=ET)
+          write_scid('smoke.scid', [
+              make_tick_record(base + timedelta(seconds=15 * i),
+                               price=20000.0 + (i % 13) * 0.25, volume=2)
+              for i in range(2000)])
+          "
+          nqcopilot --scid smoke.scid --scid-info
+          nqcopilot --scid smoke.scid --symbol MNQ --backtest --no-color > /dev/null
