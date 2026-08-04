@@ -30,7 +30,7 @@ accounts:
 - session cut-offs, the CME halt, the Apex flatten deadline
 - tick-exact prices, and commission included in every risk number
 
-These are deterministic and covered by 373 tests. A hard rule gate always beats
+These are deterministic and covered by 416 tests. A hard rule gate always beats
 a good-looking setup, and there is no code path that lets a signal override one.
 
 This is decision support. It does not place orders, and you remain responsible
@@ -251,12 +251,52 @@ exposed by accident, and it refuses oversized bodies without reading them.
 |---|---|---|
 | `--serve` | **Live trading** | TradingView alert webhooks — reads your actual chart. See above. |
 | `--csv` | Live trading, review | Export 5-minute bars from Tradovate / NinjaTrader / TradingView. |
+| `--scid` | **Backtesting on real history** | Sierra Chart's own intraday files. Tick resolution, already on disk. See below. |
 | `--live` | Learning, after-hours review | Delayed, rate-limits, revises bars. Not for funded decisions. |
 | `--poll` | Live, any quote source | Builds bars from a polled JSON price. See below. |
 | `--demo` | Testing | Deterministic synthetic bars. Means nothing about real performance. |
 
 To wire your broker feed in, produce a `list[Bar]` — that is the entire
 interface, and everything downstream works unchanged.
+
+### Sierra Chart history (`--scid`)
+
+If you run Sierra Chart, you already have real tick-resolution history for the
+instrument you trade sitting in its `Data/` directory. This is the one source
+that makes a backtest on real market data possible without a paid feed.
+
+```bash
+# What's in the file, without reading all of it
+nqcopilot --scid ~/SierraChart/Data/NQZ26.scid --scid-info
+# NQZ26.scid: 48,201,933 records of tick data, 2026-01-02 09:30 to 2026-07-27 16:59 ET
+
+# Replay a date range as 5-minute bars
+nqcopilot --scid ~/SierraChart/Data/NQZ26.scid --symbol MNQ --backtest --trades \
+          --scid-start 2026-06-01 --scid-end 2026-07-01
+```
+
+| Flag | Meaning |
+|---|---|
+| `--scid PATH` | The `.scid` file to read. |
+| `--scid-interval N` | Bar size in minutes (default 5). |
+| `--scid-start`, `--scid-end` | ISO-8601, Eastern if no offset given. Start inclusive, end exclusive. |
+| `--scid-info` | Print a summary and exit. |
+
+Worth knowing:
+
+* **Most `.scid` files are tick data, not bars.** Sierra records a single trade
+  by overloading the OHLC fields — `Open` holds a sentinel, `High` the *ask*,
+  `Low` the *bid*, `Close` the traded price. Read naively as bars, that produces
+  an opening price of zero and a range spanning the spread: not a rounding
+  error, an invented price series that still plots convincingly. The reader
+  detects tick records and aggregates them from the trade price alone.
+* **Date filters are cheap.** Records are fixed-width and time-ordered, so a
+  windowed read binary-searches to its start offset rather than scanning. Files
+  are streamed, never loaded whole — these run to gigabytes.
+* **The last bar is dropped by default.** A file can be captured mid-bar and
+  nothing in it says otherwise; an unfinished bar understates its own range and
+  quietly biases every indicator downstream.
+* Sierra owns that directory. Nothing here writes to it.
 
 ### Building bars from a quote endpoint
 
@@ -536,7 +576,7 @@ bound on quality, never as an expectation.
 ## Testing
 
 ```bash
-python3 -m pytest -q     # 373 tests
+python3 -m pytest -q     # 416 tests
 ```
 
 The suite covers the threshold ratchet and its monotonicity under random mark
@@ -553,9 +593,11 @@ easy to get quietly wrong:
 
 ## Limitations
 
-- **No performance claim.** The replay harness exists, but I have not run it on
-  real market data, so there is no expectancy figure here worth trusting. Any
-  equity curve from `--demo` is synthetic and means nothing.
+- **No performance claim.** The replay harness exists and `--scid` can now feed
+  it real history, but I have not run that combination on real market data — the
+  reader has only been exercised against synthetic ticks. So there is still no
+  expectancy figure here worth trusting, and any equity curve from `--demo` is
+  synthetic and means nothing. The path is unblocked, not walked.
 - **Parameters are conventional, not optimised.** Tuning them to a historical
   window is the classic route to something that looks superb in backtest and is
   worthless forward.
@@ -585,6 +627,7 @@ src/nqcopilot/
 ├── calendar.py    Economic-calendar fetch for automatic news blackouts
 ├── webhook.py     TradingView alert receiver (live feed from your chart)
 ├── feed.py        Quote-to-bar adapter for any price source
+├── sierra.py      Sierra Chart .scid reader (real intraday history)
 ├── data.py        CSV / live / demo loaders
 └── cli.py         The decision card
 pine/NQApexCopilot.pine

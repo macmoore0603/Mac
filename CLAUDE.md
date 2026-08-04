@@ -78,9 +78,11 @@ setting must be the safe one.
 ## Commands
 
 ```bash
-python3 -m pytest -q                                  # 373 tests
+python3 -m pytest -q                                  # 416 tests
 nqcopilot --demo                                      # decision card
 nqcopilot --csv bars.csv --backtest --trades          # replay
+nqcopilot --scid ~/SierraChart/Data/NQZ26.scid --scid-info    # inspect a file
+nqcopilot --scid NQZ26.scid --backtest                # replay real history
 nqcopilot --serve --csv bars.csv --secret "..."       # TradingView webhook feed
 nqcopilot --poll URL --poll-price-path data.last      # quote-to-bar feed
 nqcopilot --state ~/.apex.json --record-trade -125.50 # book a fill
@@ -95,15 +97,24 @@ nqcopilot --state ~/.apex.json --record-trade -125.50 # book a fill
 - The Pine indicator in `pine/` mirrors the engine. Change both together, or
   the chart and the CLI will disagree.
 - Commission is included in every risk figure. Gross R:R flatters tight stops.
+- **A Sierra `.scid` record is usually a trade, not a bar.** Sierra overloads the
+  OHLC fields for tick data: `Open` is a sentinel, `High` is the ask, `Low` the
+  bid, `Close` the trade price. Reading those four floats as a bar invents a
+  price series that still looks plottable. `sierra.py` detects and aggregates
+  ticks; never bypass it. The sentinels are float32 and must be matched by
+  magnitude — `==` against the documented literals silently fails.
 
 ## What is NOT verified
 
-- **No real-data backtest has ever run.** Free intraday futures history was not
-  reachable during development (Yahoo rate-limits, Stooq has no intraday). All
-  replay output to date is from synthetic bars and says nothing about real
-  expectancy. On demo data the strategy posts a small loss, which is the
-  *correct* result — a random walk has no edge, so a profit there would mean a
-  modelling error.
+- **No real-data backtest has ever run.** Still true, but the reason has
+  changed. Free intraday futures history was not reachable during development
+  (Yahoo rate-limits, Stooq has no intraday); `sierra.py` now reads Sierra
+  Chart's `.scid` files, so anyone with Sierra Chart installed has real
+  tick-resolution history on disk to replay against. The path is *unblocked, not
+  walked*: the reader has only ever been exercised on synthetic ticks, so every
+  expectancy figure in this repo still says nothing about real markets. On
+  synthetic data the strategy posts a small loss, which is the *correct* result
+  — a random walk has no edge, so a profit there would mean a modelling error.
 - **Indicator parameters are conventional, not optimised.** Tuning them to a
   historical window is the classic route to something that backtests superbly
   and is worthless forward.

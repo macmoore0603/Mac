@@ -347,3 +347,78 @@ class TestWatchMode:
         with pytest.raises(KeyboardInterrupt):
             run_watch(args, PLAIN)
         assert "\033[2J" in capsys.readouterr().out
+
+
+class TestSierraSource:
+    """The .scid path through the CLI.
+
+    Covered here rather than only in test_sierra.py because the flag surface is
+    where a tick file gets silently misread: `--scid` with the wrong interval or
+    an unparseable window should fail loudly, not return a shorter series.
+    """
+
+    def _write(self, tmp_path, count: int = 400):
+        from datetime import timedelta
+
+        from nqcopilot.sierra import make_tick_record, write_scid
+
+        base = datetime(2026, 7, 27, 9, 30, tzinfo=ET)
+        path = tmp_path / "NQ.scid"
+        write_scid(
+            path,
+            [
+                make_tick_record(
+                    base + timedelta(seconds=30 * i),
+                    price=20_000.0 + (i % 11) * 0.25,
+                    volume=2,
+                    bid=19_000.0,
+                    ask=21_000.0,
+                )
+                for i in range(count)
+            ],
+        )
+        return path
+
+    def test_scid_is_accepted_as_a_data_source(self, tmp_path):
+        from nqcopilot.cli import load_bars
+
+        args = _args("--scid", str(self._write(tmp_path)))
+        bars = load_bars(args)
+        assert bars
+        # Bid/ask are far outside the trades; a bar-shaped misread would show it.
+        assert all(19_500.0 < b.low <= b.high < 20_500.0 for b in bars)
+
+    def test_scid_interval_controls_bar_size(self, tmp_path):
+        from nqcopilot.cli import load_bars
+
+        path = str(self._write(tmp_path))
+        five = load_bars(_args("--scid", path, "--scid-interval", "5"))
+        one = load_bars(_args("--scid", path, "--scid-interval", "1"))
+        assert len(one) > len(five)
+
+    def test_scid_info_requires_scid(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["--scid-info"])
+
+    def test_scid_info_summarises_the_file(self, tmp_path, capsys):
+        assert main(["--scid", str(self._write(tmp_path)), "--scid-info"]) == 0
+        out = capsys.readouterr().out
+        assert "tick data" in out and "records" in out
+
+    def test_unparseable_window_is_rejected(self, tmp_path):
+        from nqcopilot.cli import load_bars
+        from nqcopilot.data import DataError
+
+        args = _args("--scid", str(self._write(tmp_path)), "--scid-start", "not-a-time")
+        with pytest.raises(DataError, match="ISO-8601"):
+            load_bars(args)
+
+    def test_a_scid_read_failure_exits_cleanly(self, tmp_path, capsys):
+        bad = tmp_path / "bad.scid"
+        bad.write_bytes(b"NOPE" + b"\x00" * 200)
+        assert main(["--scid", str(bad)]) == 2
+        assert "not a Sierra Chart" in capsys.readouterr().err
+
+    def test_no_source_names_scid_in_the_error(self, capsys):
+        assert main([]) == 2
+        assert "--scid" in capsys.readouterr().err

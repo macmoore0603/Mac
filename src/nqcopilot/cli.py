@@ -35,6 +35,7 @@ from .data import DataError, fetch_live, generate_demo_bars, load_csv
 from .feed import BarAggregator, FeedError, HttpQuoteSource
 from .market import IndicatorConfig
 from .playbook import Action, Directive, PlaybookConfig, evaluate
+from .sierra import read_scid, scid_info
 from .webhook import BarStore, WebhookConfig, WebhookContext, WebhookServer
 
 RESET = "\033[0m"
@@ -89,6 +90,30 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--demo", action="store_true", help="Use deterministic synthetic bars.")
     source.add_argument("--interval", default="5m", help="Bar interval for --live (default: 5m).")
     source.add_argument("--lookback", default="5d", help="History window for --live (default: 5d).")
+    source.add_argument(
+        "--scid",
+        type=Path,
+        help="Sierra Chart .scid intraday file (real exchange history, tick or bar).",
+    )
+    source.add_argument(
+        "--scid-interval",
+        type=int,
+        default=5,
+        help="Bar interval in minutes to build from --scid (default: 5).",
+    )
+    source.add_argument(
+        "--scid-start",
+        help="Only read --scid records at or after this time (ET, ISO-8601).",
+    )
+    source.add_argument(
+        "--scid-end",
+        help="Only read --scid records before this time (ET, ISO-8601).",
+    )
+    source.add_argument(
+        "--scid-info",
+        action="store_true",
+        help="Summarise the --scid file (records, span, kind) and exit.",
+    )
 
     account = parser.add_argument_group("account")
     account.add_argument(
@@ -272,9 +297,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_et_timestamp(raw: str | None, flag: str) -> datetime | None:
+    """Parse an ISO-8601 CLI timestamp, defaulting a bare one to Eastern."""
+    if raw is None:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DataError(f"bad {flag} value {raw!r}: expected ISO-8601") from exc
+    return ts.replace(tzinfo=ET) if ts.tzinfo is None else ts
+
+
 def load_bars(args: argparse.Namespace) -> list[Bar]:
     if args.csv:
         bars = load_csv(args.csv)
+    elif args.scid:
+        bars = read_scid(
+            args.scid,
+            interval_minutes=args.scid_interval,
+            start=_parse_et_timestamp(args.scid_start, "--scid-start"),
+            end=_parse_et_timestamp(args.scid_end, "--scid-end"),
+        )
     elif args.live:
         bars = fetch_live(args.symbol, args.interval, args.lookback)
     elif args.demo:
@@ -283,7 +326,7 @@ def load_bars(args: argparse.Namespace) -> list[Bar]:
         # Serving or polling without a seed is legal: the series builds itself.
         return []
     else:
-        raise DataError("choose a data source: --csv PATH, --live, or --demo")
+        raise DataError("choose a data source: --csv PATH, --scid PATH, --live, or --demo")
 
     validate_series(bars)
     return bars
@@ -1032,6 +1075,18 @@ def main(argv: list[str] | None = None) -> int:
                 f"New session. Balance ${state.closed_balance:,.2f}, "
                 f"threshold ${state.threshold:,.2f}, room ${state.room:,.2f}."
             )
+            return 0
+
+        if args.scid_info:
+            if not args.scid:
+                parser.error("--scid-info requires --scid")
+            info = scid_info(args.scid)
+            print(info.describe())
+            if info.is_tick_data:
+                print(
+                    "  Tick data: bars are aggregated from the trade price, "
+                    "not from the bid/ask carried in the high/low fields."
+                )
             return 0
 
         if args.watch:
