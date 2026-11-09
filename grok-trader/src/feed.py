@@ -142,9 +142,7 @@ def pool_snapshot(pair: dict | None, now_ms: int) -> dict:
     if not pair:
         return {"pair_address": None, "liquidity_usd": None, "pool_age_minutes": None,
                 "price_usd": None, "symbol": "?", "name": "?"}
-    created = pair.get("pairCreatedAt")  # milliseconds since epoch
-    if isinstance(created, bool) or not isinstance(created, (int, float)):
-        created = None
+    created = _num(pair.get("pairCreatedAt"))  # milliseconds since epoch; non-finite -> None
     base = pair.get("baseToken") or {}
     return {
         "pair_address": pair.get("pairAddress"),

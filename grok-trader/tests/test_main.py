@@ -123,12 +123,13 @@ def test_dashboard_counts_are_all_time_and_readable(tmp_path, cfg):
 
 
 def test_corrupt_paper_state_refuses_to_start(tmp_path, cfg, monkeypatch):
+    real_config = main.os.path.join(main.ROOT, "config.json")
     monkeypatch.setattr(main, "ROOT", str(tmp_path))
     state = tmp_path / "data" / "paper_state.json"
     state.parent.mkdir()
     state.write_text("{not json")
     monkeypatch.setenv("XAI_API_KEY", "x")
-    assert main.main(["--once", "--no-dashboard"]) == 3
+    assert main.main(["--once", "--no-dashboard", "--config", real_config]) == 3
 
 
 def test_dashboard_refuses_foreign_host_headers_and_bad_log_lines(tmp_path, cfg):
