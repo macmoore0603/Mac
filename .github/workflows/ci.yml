@@ -38,3 +38,27 @@ jobs:
 
       - name: Smoke test JSON output
         run: nqcopilot --demo --symbol MNQ --json > /dev/null
+
+  grok-trader:
+    # Separate sub-project in grok-trader/ (Solana new-token scanner, paper only).
+    name: grok-trader tests + offline demo
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: grok-trader
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      # No network, no keys: the three fictional tokens must score, log and stop out.
+      - name: Offline demo
+        run: python src/main.py --demo

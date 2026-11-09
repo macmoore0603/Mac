@@ -1,0 +1,33 @@
+{
+  "_comment": "Thresholds and risk limits. Tighten freely. Loosen only after reviewing logs (guide section 8). Keys starting with _ are ignored.",
+  "_grok_model_note": "grok-4.7 was confirmed on docs.x.ai/developers/models on 2026-11-09 ($2 / 1M input, $6 / 1M output). Cheaper: grok-4.3 ($1.25 / $2.50).",
+
+  "poll_interval_seconds": 60,
+  "max_new_tokens_per_cycle": 10,
+
+  "min_liquidity_usd": 25000,
+  "min_pool_age_minutes": 10,
+  "max_single_holder": 0.10,
+  "max_top10_share": 0.40,
+  "require_mint_disabled": true,
+  "require_freeze_disabled": true,
+  "require_lp_locked": true,
+  "min_lp_locked_pct": 90,
+  "lp_provider": "rugcheck",
+
+  "grok_model": "grok-4.7",
+  "grok_max_risk": 4,
+  "grok_reasoning_effort": "low",
+  "grok_timeout_seconds": 120,
+
+  "paper_starting_balance_usd": 1000,
+  "max_position_pct": 0.02,
+  "stop_loss_pct": 0.25,
+  "take_profit_pct": 0.50,
+  "max_daily_loss_pct": 0.05,
+  "max_open_positions": 5,
+  "paper_fee_pct": 0.01,
+
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 8000
+}

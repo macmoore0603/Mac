@@ -595,6 +595,21 @@ Start at `playbook.evaluate` — it returns a single `Directive`.
 
 ---
 
+## Also in this repo: `grok-trader/`
+
+A separate, self-contained sub-project: a Solana new-token scanner that filters
+rug risk with hard rules, asks Grok (xAI) for a second opinion, and **paper
+trades only**. Built from the @seb.ai "Grok AI Trading Bot" guide. It has its
+own dependencies, tests and README; nothing in it touches the futures copilot.
+
+```bash
+cd grok-trader && pip install -r requirements.txt
+python src/main.py --demo          # offline, 3 fictional tokens
+python src/main.py --mode paper    # live data, fake money, dashboard on :8000
+```
+
+---
+
 ## Licence
 
 MIT. Trading futures involves substantial risk of loss and is not suitable for
