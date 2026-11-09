@@ -69,3 +69,24 @@ def test_seen_cache_persists_and_prunes(tmp_path):
 def test_rate_limiter_spacing():
     assert feed.RateLimiter(60).interval == pytest.approx(1.0)
     assert feed.RateLimiter(0).interval == 60.0
+
+
+def test_backoff_sleep_prefers_retry_after(monkeypatch):
+    # conftest stubs feed.backoff_sleep for every test; load a fresh copy of the module to test the real one.
+    import importlib.util, os
+    spec = importlib.util.spec_from_file_location("feed_fresh", os.path.join(os.path.dirname(feed.__file__), "feed.py"))
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    waits = []
+    monkeypatch.setattr(fresh.time, "sleep", lambda w: waits.append(w))
+    fresh.backoff_sleep(0, retry_after="7")
+    fresh.backoff_sleep(2, retry_after="garbage")
+    fresh.backoff_sleep(10, retry_after=None)
+    assert waits[0] == 7.0 and 4.2 <= waits[1] <= 7.8 and waits[2] == 30.0
+
+
+def test_get_json_passes_retry_after(monkeypatch):
+    seen = []
+    monkeypatch.setattr(feed, "backoff_sleep", lambda attempt, **kw: seen.append(kw.get("retry_after")))
+    s = FakeSession({("GET", "x"): [FakeResponse(429, headers={"Retry-After": "3"}), FakeResponse(200, {"ok": 1})]})
+    assert feed.get_json(s, "https://x/") == {"ok": 1} and seen == ["3"]

@@ -17,7 +17,8 @@
 
   "grok_model": "grok-4.7",
   "grok_max_risk": 4,
-  "grok_timeout_seconds": 45,
+  "grok_reasoning_effort": "low",
+  "grok_timeout_seconds": 120,
 
   "paper_starting_balance_usd": 1000,
   "max_position_pct": 0.02,

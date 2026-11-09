@@ -50,7 +50,13 @@ def summarize(records: list[dict]) -> dict:
     """Action counts and per-check PASS/FAIL/UNKNOWN counts for the dashboard."""
     actions = Counter(r.get("action", "?") for r in records)
     checks: dict[str, Counter] = {}
+    grok_calls, grok_cost = 0, 0.0
     for r in records:
         for c in r.get("checks") or []:
             checks.setdefault(c["name"], Counter())[c["status"]] += 1
-    return {"actions": dict(actions), "checks": {k: dict(v) for k, v in checks.items()}}
+        g = r.get("grok")
+        if isinstance(g, dict) and g.get("usage"):
+            grok_calls += 1
+            grok_cost += g.get("cost_usd") or 0.0
+    return {"actions": dict(actions), "checks": {k: dict(v) for k, v in checks.items()},
+            "grok_calls": grok_calls, "grok_cost_usd": round(grok_cost, 4)}

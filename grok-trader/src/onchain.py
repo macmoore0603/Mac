@@ -28,10 +28,11 @@ def rpc_call(session: requests.Session, url: str, method: str, params: list,
              *, timeout: float = 20, retries: int = 4):
     """One JSON-RPC call with backoff on HTTP 429/403/5xx and JSON-RPC 429 errors."""
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    last = "no attempt"
+    last, retry_after = "no attempt", None
     for attempt in range(retries):
         try:
             r = session.post(url, json=body, timeout=timeout)
+            retry_after = r.headers.get("Retry-After")
             if r.status_code == 200:
                 data = r.json()
                 if "result" in data:
@@ -50,8 +51,18 @@ def rpc_call(session: requests.Session, url: str, method: str, params: list,
         except (requests.RequestException, ValueError) as exc:
             last = f"{type(exc).__name__}: {exc}"
         log.warning("%s failed (%s), retry %d/%d", method, last, attempt + 1, retries)
-        backoff_sleep(attempt)
+        backoff_sleep(attempt, retry_after=retry_after)
     raise RpcError(f"{method}: {last}")
+
+
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+
+
+def normalize_authority(value):
+    """RugCheck encodes 'no authority' as null, "" or the system program; the RPC uses null."""
+    if value in (None, "", SYSTEM_PROGRAM):
+        return None
+    return value if isinstance(value, str) else UNREADABLE
 
 
 def mint_info(session, url: str, mint: str) -> dict:
@@ -90,10 +101,11 @@ def largest_holders(session, url: str, mint: str) -> list[dict]:
 def rugcheck_report(session, mint: str) -> dict | None:
     """Full RugCheck report, or None when the token is unknown / provider is down."""
     try:
-        return get_json(session, RUGCHECK_REPORT_URL.format(mint=mint), limiter=_rugcheck_limiter)
+        report = get_json(session, RUGCHECK_REPORT_URL.format(mint=mint), limiter=_rugcheck_limiter)
     except Exception as exc:  # provider trouble must not kill the cycle
         log.warning("rugcheck failed for %s: %s", mint, exc)
         return None
+    return report if isinstance(report, dict) else None  # the API can answer 200 with a bare null
 
 
 def pool_owners(report: dict | None) -> set[str]:
@@ -179,7 +191,8 @@ def gather(session, rpc_url: str, mint: str, snapshot: dict, use_rugcheck: bool 
         token["errors"].append(str(exc))
         if report and isinstance(report.get("token"), dict):  # fallback: RugCheck read the mint too
             t = report["token"]
-            token.update({"mint_authority": t.get("mintAuthority"), "freeze_authority": t.get("freezeAuthority"),
+            token.update({"mint_authority": normalize_authority(t.get("mintAuthority")),
+                          "freeze_authority": normalize_authority(t.get("freezeAuthority")),
                           "supply": t.get("supply"), "token_program": report.get("tokenProgram")})
 
     try:

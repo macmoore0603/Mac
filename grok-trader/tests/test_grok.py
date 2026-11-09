@@ -31,19 +31,35 @@ def test_missing_key_never_calls_the_network():
 
 def test_success_returns_parsed_reply_and_usage():
     body = {"choices": [{"message": {"content": '{"risk": 2, "reasons": ["ok"], "missing_data": ["lp"]}'}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost_in_usd_ticks": 25000000}}
     s = FakeSession({("POST", "api.x.ai"): [FakeResponse(200, body)]})
     r = grok.ask_grok(s, "key", "grok-x", {"mint": "m"})
     assert r["risk"] == 2 and r["reasons"] == ["ok"] and r["usage"]["prompt_tokens"] == 10 and r["error"] is None
+    assert r["cost_usd"] == 0.0025  # 10^10 ticks per dollar
     sent = s.calls[0][2]["json"]
     assert sent["model"] == "grok-x" and sent["response_format"]["type"] == "json_schema"
+    assert sent["reasoning_effort"] == "low" and "stop" not in sent
     assert sent["response_format"]["json_schema"]["schema"]["required"] == ["risk", "reasons", "missing_data"]
     assert s.calls[0][2]["headers"]["Authorization"] == "Bearer key"
 
 
-def test_401_is_final_and_400_retries_without_response_format():
-    s = FakeSession({("POST", "api.x.ai"): [FakeResponse(401, {}, "bad key")]})
+def test_wrong_key_is_final_whether_401_or_400():
+    s = FakeSession({("POST", "api.x.ai"): [FakeResponse(401, {"code": "unauthenticated:no-credentials", "error": "No credentials presented."})]})
     assert "401" in grok.ask_grok(s, "key", "m", {})["error"] and len(s.calls) == 1
+    bad = {"code": "invalid-argument", "error": "Incorrect API key provided. You can obtain an API key from https://console.x.ai."}
+    s = FakeSession({("POST", "api.x.ai"): [FakeResponse(400, bad)]})
+    r = grok.ask_grok(s, "key", "m", {})
+    assert r["error"].startswith("xAI rejected the API key (400)") and len(s.calls) == 1
+
+
+def test_other_400s_are_final_after_one_plain_text_retry():
+    s = FakeSession({("POST", "api.x.ai"): [FakeResponse(400, {"code": "400", "error": "Bad data: model not found"})]})
+    r = grok.ask_grok(s, "key", "m", {})
+    assert r["error"].startswith("HTTP 400") and "model not found" in r["error"] and len(s.calls) == 2
+    assert "response_format" not in s.calls[1][2]["json"]
+
+
+def test_401_is_final_and_400_retries_without_response_format():
     ok = {"choices": [{"message": {"content": '{"risk": 1, "reasons": ["r"]}'}}]}
     s = FakeSession({("POST", "api.x.ai"): [FakeResponse(400, {}, "unsupported response_format"), FakeResponse(200, ok)]})
     r = grok.ask_grok(s, "key", "m", {})

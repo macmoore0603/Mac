@@ -100,3 +100,29 @@ def test_gather_with_everything_down_stays_unknown():
     token, report = onchain.gather(s, RPC, MINT, {"pair_address": None})
     assert report is None and token["mint_authority"] == UNREADABLE and token["largest_holder_share"] is None
     assert token["lp_status"] == "UNKNOWN" and token["holder_source"] is None and len(token["errors"]) == 2
+
+
+def test_rugcheck_report_must_be_an_object():
+    assert onchain.rugcheck_report(FakeSession({("GET", "rugcheck"): [FakeResponse(200, None, "null")]}), MINT) is None
+    assert onchain.rugcheck_report(FakeSession({("GET", "rugcheck"): [FakeResponse(200, [1, 2])]}), MINT) is None
+    assert onchain.rugcheck_report(FakeSession({("GET", "rugcheck"): [FakeResponse(400, {"error": "invalid token mint"})]}), MINT) is None
+
+
+def test_normalize_authority_treats_null_empty_and_system_program_as_disabled():
+    for v in (None, "", onchain.SYSTEM_PROGRAM):
+        assert onchain.normalize_authority(v) is None
+    assert onchain.normalize_authority("SomeWallet") == "SomeWallet"
+    assert onchain.normalize_authority({"lamports": 1}) == UNREADABLE
+    fallback = {**REPORT, "token": {"mintAuthority": onchain.SYSTEM_PROGRAM, "freezeAuthority": "", "supply": 1}}
+    s = FakeSession({("GET", "rugcheck"): [FakeResponse(200, fallback)], ("POST", RPC): [FakeResponse(503)]})
+    token, _ = onchain.gather(s, RPC, MINT, {"pair_address": "PAIR1"})
+    assert token["mint_authority"] is None and token["freeze_authority"] is None
+
+
+def test_rpc_call_passes_retry_after_to_backoff(monkeypatch):
+    import feed
+    seen = []
+    monkeypatch.setattr(feed, "backoff_sleep", lambda attempt, **kw: seen.append(kw.get("retry_after")))
+    monkeypatch.setattr(onchain, "backoff_sleep", lambda attempt, **kw: seen.append(kw.get("retry_after")))
+    s = FakeSession({("POST", RPC): [FakeResponse(429, headers={"Retry-After": "10"}), rpc_ok({"v": 1})]})
+    assert onchain.rpc_call(s, RPC, "m", []) == {"v": 1} and seen == ["10"]

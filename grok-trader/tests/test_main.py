@@ -80,6 +80,7 @@ def test_dashboard_renders(tmp_path, cfg):
     assert page.status_code == 200 and b"SAFEPUP" in page.data and b"Open positions (1)" in page.data
     state = client.get("/api/state").get_json()
     assert state["paper"]["open_positions"][0]["mint"] == mint and state["stats"]["actions"] == {"buy": 1}
+    assert state["stats"]["grok_calls"] == 0 and b"Grok spend" in page.data  # demo replies carry no usage
 
 
 def test_dashboard_escapes_untrusted_symbols(tmp_path, cfg):

@@ -59,7 +59,8 @@ class Bot:
         self.api_key = api_key
         self.now = now_fn or (lambda: datetime.now(timezone.utc))
         self.grok_fn = grok_fn or (lambda payload: grok.ask_grok(
-            self.session, self.api_key, cfg["grok_model"], payload, timeout=cfg.get("grok_timeout_seconds", 45)))
+            self.session, self.api_key, cfg["grok_model"], payload,
+            timeout=cfg.get("grok_timeout_seconds", 120), reasoning_effort=cfg.get("grok_reasoning_effort", "low")))
         self.price_fn = price_fn or (lambda mint: feed.current_price(self.session, mint))
         self.broker = PaperBroker(paths["state"], cfg)
         self.seen = feed.SeenCache(paths["seen"])

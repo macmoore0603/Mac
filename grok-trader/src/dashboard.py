@@ -30,6 +30,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="tile"><small>Today</small><b>${{ "%.2f"|format(p.today_realized_pnl_usd) }}</b>
    {% if p.halted_today %}<small style="color:#c33">daily loss limit hit</small>{% endif %}</div>
  <div class="tile"><small>Closed trades</small><b>{{ p.closed_trades }}</b><small>{{ p.wins }} wins / {{ p.losses }} losses · {{ p.stop_losses_fired }} stops</small></div>
+ <div class="tile"><small>Grok spend (logged)</small><b>${{ "%.4f"|format(stats.grok_cost_usd) }}</b><small>{{ stats.grok_calls }} calls</small></div>
 </div>
 <h2>Open positions ({{ p.open_positions|length }})</h2>
 <table><tr><th>Token</th><th>Entry</th><th>Last</th><th>Stop</th><th>Target</th><th>Cost</th><th>Opened</th></tr>

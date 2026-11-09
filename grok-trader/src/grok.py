@@ -75,10 +75,27 @@ def parse_reply(text: str) -> dict:
             "missing_data": strings(obj.get("missing_data")), "error": None}
 
 
+def _error_text(r) -> str:
+    """xAI error bodies are usually {"code":..., "error":...}, sometimes plain text."""
+    try:
+        data = r.json()
+        if isinstance(data, dict) and (data.get("error") or data.get("code")):
+            return f"{data.get('code') or ''} {data.get('error') or ''}".strip()
+    except ValueError:
+        pass
+    return (r.text or "")[:300]
+
+
 def ask_grok(session: requests.Session, api_key: str | None, model: str, payload: dict,
-             *, timeout: float = 45, retries: int = 3) -> dict:
-    """Return parse_reply(...) plus model/usage/raw. Never raises; errors are data."""
-    base = {"risk": None, "reasons": [], "missing_data": [], "model": model, "usage": None, "raw": None}
+             *, timeout: float = 120, retries: int = 3, reasoning_effort: str | None = "low") -> dict:
+    """Return parse_reply(...) plus model/usage/cost/raw. Never raises; errors are data.
+
+    grok-4.x models reason before answering and bill those tokens as output, so
+    the default asks for low reasoning effort: this is a short classification,
+    not a research task. The reply is parsed as data only (see parse_reply).
+    """
+    base = {"risk": None, "reasons": [], "missing_data": [], "model": model,
+            "usage": None, "cost_usd": None, "raw": None}
     if not api_key or api_key == "your_key_here":
         return {**base, "error": "XAI_API_KEY not set"}
     body = {
@@ -87,11 +104,14 @@ def ask_grok(session: requests.Session, api_key: str | None, model: str, payload
                      {"role": "user", "content": json.dumps(payload, default=str)}],
         "response_format": RESPONSE_FORMAT,
     }
-    last = "no attempt"
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
+    last, retry_after = "no attempt", None
     for attempt in range(retries):
         try:
             r = session.post(XAI_URL, json=body, timeout=timeout,
                              headers={"Authorization": f"Bearer {api_key}"})
+            retry_after = r.headers.get("Retry-After")
             if r.status_code == 200:
                 data = r.json()
                 message = (data.get("choices") or [{}])[0].get("message") or {}
@@ -99,18 +119,22 @@ def ask_grok(session: requests.Session, api_key: str | None, model: str, payload
                 parsed = parse_reply(text)
                 if parsed["error"] and message.get("refusal"):
                     parsed["error"] = f"model refused: {str(message['refusal'])[:200]}"
-                return {**base, **parsed, "usage": data.get("usage"), "raw": text[:2000]}
-            if r.status_code == 401:
-                return {**base, "error": "xAI rejected the API key (401)"}
+                usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+                ticks = (usage or {}).get("cost_in_usd_ticks")  # 10^10 ticks per US dollar
+                cost = round(ticks / 1e10, 6) if isinstance(ticks, (int, float)) else None
+                return {**base, **parsed, "usage": usage, "cost_usd": cost, "raw": text[:2000]}
+            detail = _error_text(r)
+            if r.status_code == 401 or (r.status_code == 400 and "api key" in detail.lower()):
+                return {**base, "error": f"xAI rejected the API key ({r.status_code}): {detail[:160]}"}
             if r.status_code == 400 and "response_format" in body:
-                body.pop("response_format")  # older models: retry as plain text
-                last = "400, retrying without response_format"
+                body.pop("response_format")  # a model without structured output: retry as plain text
+                last = f"400 ({detail[:120]}), retrying without response_format"
+            elif r.status_code == 429 or r.status_code >= 500:
+                last = f"HTTP {r.status_code}: {detail[:200]}"
             else:
-                last = f"HTTP {r.status_code}: {r.text[:200]}"
-                if r.status_code != 429 and r.status_code < 500:
-                    return {**base, "error": last}
+                return {**base, "error": f"HTTP {r.status_code}: {detail[:200]}"}
         except (requests.RequestException, ValueError) as exc:
             last = f"{type(exc).__name__}: {exc}"
         log.warning("grok call failed (%s), retry %d/%d", last, attempt + 1, retries)
-        backoff_sleep(attempt)
+        backoff_sleep(attempt, retry_after=retry_after)
     return {**base, "error": f"grok unavailable after {retries} tries: {last}"}

@@ -39,20 +39,30 @@ class RateLimiter:
         self.next_ok = max(now, self.next_ok) + self.interval
 
 
-def backoff_sleep(attempt: int, base: float = 1.5, cap: float = 30.0) -> None:
-    """Exponential backoff with jitter: 1.5s, 3s, 6s, ... capped at 30s."""
-    time.sleep(min(cap, base * 2 ** attempt) * (0.7 + 0.6 * random.random()))
+def backoff_sleep(attempt: int, base: float = 1.5, cap: float = 30.0, retry_after=None) -> None:
+    """Exponential backoff with jitter: 1.5s, 3s, 6s, ... capped at 30s.
+
+    A server-sent Retry-After (seconds) wins over the exponential schedule.
+    """
+    try:
+        wait = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        wait = None
+    if wait is None or wait <= 0:
+        wait = base * 2 ** attempt * (0.7 + 0.6 * random.random())
+    time.sleep(min(cap, wait))
 
 
 def get_json(session: requests.Session, url: str, *, limiter: RateLimiter | None = None,
              timeout: float = 20, retries: int = 4):
     """GET and parse JSON, retrying on 429 / 5xx / network errors."""
-    last = "no attempt"
+    last, retry_after = "no attempt", None
     for attempt in range(retries):
         if limiter:
             limiter.wait()
         try:
             r = session.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+            retry_after = r.headers.get("Retry-After")
             if r.status_code == 200:
                 return r.json()
             if r.status_code in (400, 404):
@@ -63,7 +73,7 @@ def get_json(session: requests.Session, url: str, *, limiter: RateLimiter | None
         except (requests.RequestException, json.JSONDecodeError) as exc:
             last = f"{type(exc).__name__}: {exc}"
         log.warning("GET %s failed (%s), retry %d/%d", url, last, attempt + 1, retries)
-        backoff_sleep(attempt)
+        backoff_sleep(attempt, retry_after=retry_after)
     raise FeedError(f"GET {url}: {last}")
 
 

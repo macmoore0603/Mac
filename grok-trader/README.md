@@ -132,7 +132,8 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 | `lp_provider` | "rugcheck" | Where LP and pool data come from (`"none"` disables it: LP becomes UNKNOWN and every token is skipped) |
 | `grok_model` | see section 9 | xAI model name sent to the API |
 | `grok_max_risk` | 4 | Grok risk must be at or below this (0-10) |
-| `grok_timeout_seconds` | 45 | HTTP timeout for the Grok call |
+| `grok_reasoning_effort` | "low" | grok-4.x models think before answering and bill those tokens as output; low keeps a short classification cheap and fast. Set to `null` to omit the parameter |
+| `grok_timeout_seconds` | 120 | HTTP timeout for the Grok call (reasoning models can take a while) |
 | `paper_starting_balance_usd` | 1000 | Fake starting balance |
 | `max_position_pct` | 0.02 | Each paper buy is 2% of the current balance |
 | `stop_loss_pct` | 0.25 | Sell at -25% |
@@ -173,7 +174,8 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 - **Paper fills are optimistic.** A 1% haircut per side is applied, but a real thin pool moves against you when you trade it, and fees vary. Treat paper results as "the code runs", not "the strategy works".
 - **Each token is scored once**, including tokens that errored. The feed shows the same tokens for a long time, so this keeps API usage small; it also means a transient outage can make the bot skip a token for good.
 - **"Day" is the UTC calendar day** for the daily loss limit.
-- **Without `XAI_API_KEY`** every token stops at the Grok step with `grok unavailable: XAI_API_KEY not set`. No key, no paper trades: the Grok read is a required gate, not a bonus.
+- **Without `XAI_API_KEY`** every token stops at the Grok step with `grok unavailable: XAI_API_KEY not set`. No key, no paper trades: the Grok read is a required gate, not a bonus. A wrong key shows up as `xAI rejected the API key (400)`: xAI answers 400, not 401, for an incorrect key.
+- **Grok costs real money per call.** Each reply's exact cost (from xAI's `usage.cost_in_usd_ticks`) is logged as `grok.cost_usd` and totalled on the dashboard. Only all-PASS tokens are sent, and the request asks for low reasoning effort; expect well under a cent per call at the published grok-4.7 prices, but watch the tile.
 
 ## 9. What was verified, and what was not
 
@@ -186,12 +188,12 @@ official documentation pages, while writing the code:
 | DEX Screener `GET /token-pairs/v1/solana/{token}` | Returns a list of up to 30 pairs (no pagination); the token can be the base OR the quote side, so the bot keeps base-side pools; `pairAddress`, `dexId`, `priceUsd` (string), `liquidity.usd` (absent for bonding-curve pairs), `pairCreatedAt` (ms since epoch), `fdv`, `marketCap`, `volume.h24`, `txns.h1.buys/sells`; documented 300 req/min; unknown token returns `[]` |
 | Solana RPC | `https://api.mainnet.solana.com` is the documented public endpoint (`api.mainnet-beta.solana.com` resolves to the same node); `getTokenSupply`, `getAccountInfo` (jsonParsed: `data.parsed.info.mintAuthority / freezeAuthority / supply / decimals`, disabled authority is JSON `null`) for both the classic Token program and Token-2022; `getMultipleAccounts` for owners; `getTokenLargestAccounts` refused on the free tier (`x-ratelimit-method-limit: 0`, JSON-RPC error 429 inside HTTP 200); documented limits 100 req/10 s per IP, 40 per method |
 | RugCheck `GET /v1/tokens/{mint}/report` | No key needed; documented anonymous limit 1 request/second (headers advertise 15 per window); `markets[].lp.lpLockedPct`, `markets[].marketType`, `knownAccounts` (typed `AMM` / `CREATOR` / `LOCKER`), `topHolders[].owner/pct/insider` (can be `null`), `token.mintAuthority/freezeAuthority/supply`, `risks[].name/level`, `score_normalised`; `rugged` is deprecated and not used; garbage mint returns 400 |
-| xAI | `POST https://api.x.ai/v1/chat/completions` with `Authorization: Bearer`; model `grok-4.7` exists at $2 / 1M input and $6 / 1M output tokens (grok-4.3 is cheaper); structured output via `response_format` `json_schema` (primary) or `json_object`; 401 for a bad key, 429 for rate limits with backoff recommended; reply at `choices[0].message.content`, a refusal at `choices[0].message.refusal` |
+| xAI | `POST https://api.x.ai/v1/chat/completions` with `Authorization: Bearer` (xAI now labels this endpoint legacy/deprecated in favour of `/v1/responses`, with no retirement date); model `grok-4.7` exists at $2 / 1M input and $6 / 1M output tokens, reasoning tokens billed as output (grok-4.3 is cheaper); `reasoning_effort` low/medium/high/xhigh; structured output via `response_format` `json_schema` (primary) or `json_object`; 401 with no credentials, **400 `invalid-argument` for a wrong key**, 429 for rate limits; reply at `choices[0].message.content`, a refusal at `choices[0].message.refusal`, exact cost at `usage.cost_in_usd_ticks` |
 
 Not verified here:
 
 - No paid Grok call was made, so the exact 429 headers and whether every model accepts `json_schema` were not observed. If a model rejects it (400), the bot retries once as plain text. If the model name is rejected, the error appears in the log as `grok unavailable: HTTP 4xx ...`; the fix is a one-line change in `config.json`.
-- RugCheck's rate-limit window behind the `x-rate-limit-limit: 15` header, and whether `lpLockedPct` counts burned LP (there is no explicit "burned" field; locked and burned are both treated as locked here). On pump.fun bonding-curve markets there is no LP token at all, so the bot reports LP as UNKNOWN for them.
+- RugCheck's rate-limit window behind the `x-rate-limit-limit: 15` header, and whether `lpLockedPct` counts burned LP (there is no explicit "burned" field; locked and burned are both treated as locked here). On pump.fun bonding-curve markets there is no LP token at all (RugCheck still reports 100% "locked" because the curve is program-controlled); the figure is not comparable with a real pool, so the bot reports LP as UNKNOWN for them, which is the conservative direction.
 - Any real-money result. No backtest exists, and no edge is claimed. On the demo the bot loses a few dollars to its own stop-loss, which is the honest result for a test with fictional data.
 
 ## 10. Tests
