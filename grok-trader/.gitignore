@@ -1,0 +1,8 @@
+# Secrets: never commit your API keys.
+.env
+# Local runtime state and logs.
+data/
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
