@@ -29,7 +29,7 @@ def score(checks: list[CheckResult], grok: dict | None) -> int:
         return 0
     hard = 60 * sum(1 for c in checks if c.status == PASS) / len(checks)
     risk = (grok or {}).get("risk")
-    ai = 40 * (10 - risk) / 10 if isinstance(risk, (int, float)) else 0
+    ai = 40 * (10 - risk) / 10 if isinstance(risk, (int, float)) and not isinstance(risk, bool) else 0
     return int(round(hard + ai))
 
 
@@ -41,7 +41,7 @@ def decide(checks: list[CheckResult], grok: dict | None, cfg: dict) -> Decision:
     if not grok or grok.get("error"):
         return Decision(SKIP, s, "grok unavailable: " + str((grok or {}).get("error") or "no reply"))
     risk = grok.get("risk")
-    if not isinstance(risk, (int, float)) or not 0 <= risk <= 10:
+    if isinstance(risk, bool) or not isinstance(risk, (int, float)) or not 0 <= risk <= 10:
         return Decision(SKIP, s, "grok risk missing or out of range")
     if not grok.get("reasons"):
         return Decision(SKIP, s, "grok gave a number without reasons")

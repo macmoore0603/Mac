@@ -101,13 +101,13 @@ class PaperBroker:
         return None
 
     def close(self, mint: str, price: float, ts: datetime, reason: str) -> dict:
+        day = self._day(ts)  # before the trade changes balance or positions, so a new day starts clean
         pos = self.state["positions"].pop(mint)
         gross = pos["qty"] * price
         fee = gross * self.cfg["paper_fee_pct"]
         proceeds = gross - fee
         pnl = proceeds - pos["cost_usd"]
         self.state["balance_usd"] += proceeds
-        day = self._day(ts)
         day["realized_pnl"] += pnl
         if day["realized_pnl"] <= -self.cfg["max_daily_loss_pct"] * day["start_equity"]:
             day["halted"] = True

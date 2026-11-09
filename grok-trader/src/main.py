@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -35,12 +36,34 @@ REQUIRED = ("poll_interval_seconds", "max_new_tokens_per_cycle", "min_liquidity_
             "max_open_positions", "paper_fee_pct")
 
 
+FRACTIONS = ("max_single_holder", "max_top10_share", "max_position_pct", "stop_loss_pct",
+             "max_daily_loss_pct", "paper_fee_pct")
+MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")  # base58 Solana address
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def load_config(path: str) -> dict:
     with open(path, encoding="utf-8") as fh:
         cfg = {k: v for k, v in json.load(fh).items() if not k.startswith("_")}
     missing = [k for k in REQUIRED if k not in cfg]
     if missing:
         sys.exit(f"config.json is missing: {', '.join(missing)}")
+    for k in FRACTIONS:  # a stop at 100% never fires; a 150% position is not a position
+        if not _number(cfg[k]) or not 0 < cfg[k] < 1:
+            sys.exit(f"config.json: {k} must be a fraction between 0 and 1, got {cfg[k]!r}")
+    for k in ("poll_interval_seconds", "max_new_tokens_per_cycle", "take_profit_pct",
+              "paper_starting_balance_usd", "max_open_positions"):
+        if not _number(cfg[k]) or cfg[k] <= 0:
+            sys.exit(f"config.json: {k} must be a positive number, got {cfg[k]!r}")
+    for k in ("min_liquidity_usd", "min_pool_age_minutes"):
+        if not _number(cfg[k]) or cfg[k] < 0:
+            sys.exit(f"config.json: {k} must be zero or more, got {cfg[k]!r}")
+    if not _number(cfg["grok_max_risk"]) or not 0 <= cfg["grok_max_risk"] <= 10:
+        sys.exit(f"config.json: grok_max_risk must be between 0 and 10, got {cfg['grok_max_risk']!r}")
+    cfg.setdefault("lp_provider", "rugcheck")
     return cfg
 
 
@@ -82,7 +105,8 @@ class Bot:
                   "price_usd": snapshot.get("price_usd"), "score": decision.score, "reason": decision.reason,
                   "checks": [c.to_dict() for c in results], "grok": grok_res, "market": snapshot,
                   "holders": {k: token.get(k) for k in ("largest_holder_share", "top10_share", "holder_source")},
-                  "authorities": {k: token.get(k) for k in ("mint_authority", "freeze_authority", "token_program")},
+                  "authorities": {k: token.get(k) for k in ("mint_authority", "freeze_authority", "token_program",
+                                                           "authority_source")},
                   "lp": {"status": token.get("lp_status"), "locked_pct": token.get("lp_locked_pct")},
                   "rugcheck": rug, "data_errors": token.get("errors") or []}
         if decision.action == scoring.BUY:
@@ -126,13 +150,19 @@ class Bot:
             fresh = [m for m in feed.latest_solana_tokens(self.session) if m not in self.seen]
         except feed.FeedError as exc:
             log.error("token feed unavailable: %s", exc)
+            journal.append(self.paths["log"], {"action": "error", "token": None, "symbol": None, "score": None,
+                                               "reason": f"token feed unavailable: {exc}"})
             return
         for mint in fresh[: self.cfg["max_new_tokens_per_cycle"]]:
+            if not MINT_RE.match(mint):  # never put an odd string into a URL or an RPC call
+                log.warning("skipping malformed token address %r", mint[:60])
+                self.seen.add(mint, journal.iso(self.now()))
+                continue
             try:
                 snapshot = feed.pool_snapshot(feed.main_pool(feed.token_pairs(self.session, mint), mint),
                                               int(self.now().timestamp() * 1000))
                 token, report = onchain.gather(self.session, self.rpc_url, mint, snapshot,
-                                               use_rugcheck=self.cfg.get("lp_provider") == "rugcheck")
+                                               use_rugcheck=self.cfg.get("lp_provider", "rugcheck") == "rugcheck")
                 self.process_token(mint, snapshot, token, report)
             except Exception as exc:  # one bad token must never stop the loop
                 log.exception("error on %s", mint)
@@ -146,21 +176,24 @@ DEMO_TOKENS = [
     ("DemoSafePup11111111111111111111111111111111", "SAFEPUP", "all rules pass and Grok is relaxed -> paper buy",
      {"symbol": "SAFEPUP", "name": "Safe Pup (fictional)", "price_usd": 0.0012, "liquidity_usd": 82000.0,
       "pool_age_minutes": 45.0, "pair_address": "DemoPair1", "dex_id": "raydium"},
-     {"mint_authority": None, "freeze_authority": None, "largest_holder_share": 0.06, "top10_share": 0.31,
-      "holder_source": "rpc", "lp_status": "LOCKED", "lp_locked_pct": 100.0, "token_program": "Tokenkeg...", "errors": []},
+     {"mint_authority": None, "freeze_authority": None, "authority_source": "rpc", "largest_holder_share": 0.06,
+      "top10_share": 0.31, "holder_source": "rpc", "lp_status": "LOCKED", "lp_locked_pct": 100.0,
+      "token_program": "Tokenkeg...", "errors": []},
      {"risk": 2, "reasons": ["liquidity $82,000 is comfortably above $25,000", "top-10 hold 31%, largest 6%",
                              "mint and freeze authority disabled, LP 100% locked"], "missing_data": [], "error": None}),
     ("DemoRugLord11111111111111111111111111111111", "RUGLORD", "mint authority still enabled and one wallet holds 35%",
      {"symbol": "RUGLORD", "name": "Rug Lord (fictional)", "price_usd": 0.5, "liquidity_usd": 60000.0,
       "pool_age_minutes": 30.0, "pair_address": "DemoPair2", "dex_id": "raydium"},
-     {"mint_authority": "DemoDeployerWallet", "freeze_authority": None, "largest_holder_share": 0.35,
-      "top10_share": 0.62, "holder_source": "rpc", "lp_status": "LOCKED", "lp_locked_pct": 100.0, "errors": []},
+     {"mint_authority": "DemoDeployerWallet", "freeze_authority": None, "authority_source": "rpc",
+      "largest_holder_share": 0.35, "top10_share": 0.62, "holder_source": "rpc", "lp_status": "LOCKED",
+      "lp_locked_pct": 100.0, "errors": []},
      None),
     ("DemoThinPool1111111111111111111111111111111", "THINPOOL", "thin liquidity and LP status unknown",
      {"symbol": "THINPOOL", "name": "Thin Pool (fictional)", "price_usd": 0.00004, "liquidity_usd": 4000.0,
       "pool_age_minutes": 3.0, "pair_address": "DemoPair3", "dex_id": "pumpfun"},
-     {"mint_authority": None, "freeze_authority": None, "largest_holder_share": 0.08, "top10_share": 0.38,
-      "holder_source": "rugcheck", "lp_status": "UNKNOWN", "lp_locked_pct": None, "errors": ["getTokenLargestAccounts: not available on this RPC tier"]},
+     {"mint_authority": None, "freeze_authority": None, "authority_source": "rpc", "largest_holder_share": 0.08,
+      "top10_share": 0.38, "holder_source": "rugcheck", "lp_status": "UNKNOWN", "lp_locked_pct": None,
+      "errors": ["getTokenLargestAccounts: not available on this RPC tier"]},
      None),
 ]
 
@@ -219,6 +252,9 @@ def main(argv: list[str] | None = None) -> int:
     if bot.rpc_url == onchain.DEFAULT_RPC_URL:
         log.warning("Using the public Solana RPC: holder data will come from RugCheck (the free tier does not "
                     "serve getTokenLargestAccounts). A dedicated RPC URL in .env fixes that.")
+    if cfg.get("lp_provider") != "rugcheck":
+        log.warning("lp_provider is %r: LP status will be UNKNOWN and every token will be skipped.",
+                    cfg.get("lp_provider"))
     if not args.no_dashboard:
         from dashboard import start_dashboard
         host, port = cfg.get("dashboard_host", "127.0.0.1"), int(cfg.get("dashboard_port", 8000))
@@ -227,7 +263,10 @@ def main(argv: list[str] | None = None) -> int:
     log.info("paper mode, polling every %ss, log -> %s", cfg["poll_interval_seconds"], bot.paths["log"])
     try:
         while True:
-            bot.cycle()
+            try:
+                bot.cycle()
+            except Exception:  # a surprise must never end the run; the next cycle starts fresh
+                log.exception("cycle failed; retrying after the usual pause")
             if args.once:
                 break
             time.sleep(cfg["poll_interval_seconds"])

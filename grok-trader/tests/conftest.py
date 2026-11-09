@@ -24,7 +24,10 @@ class FakeSession:
         self.calls.append((method, url, kw))
         for key, responses in self.routes.items():
             if key[0] == method and key[1] in url:
-                return responses.pop(0) if len(responses) > 1 else responses[0]
+                resp = responses.pop(0) if len(responses) > 1 else responses[0]
+                if isinstance(resp, BaseException):
+                    raise resp
+                return resp
         raise AssertionError(f"unexpected {method} {url}")
 
     def get(self, url, **kw):

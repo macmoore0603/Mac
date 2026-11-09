@@ -7,6 +7,7 @@ read becomes None / UNKNOWN, and UNKNOWN never passes a check.
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit
 
 import requests
 
@@ -28,30 +29,32 @@ def rpc_call(session: requests.Session, url: str, method: str, params: list,
              *, timeout: float = 20, retries: int = 4):
     """One JSON-RPC call with backoff on HTTP 429/403/5xx and JSON-RPC 429 errors."""
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    host = urlsplit(url).hostname or "rpc"  # provider URLs carry keys: log the host, never the URL
     last, retry_after = "no attempt", None
     for attempt in range(retries):
         try:
             r = session.post(url, json=body, timeout=timeout)
             retry_after = r.headers.get("Retry-After")
+            if r.headers.get("x-ratelimit-method-limit") == "0":  # the free tier does not serve this method
+                raise RpcError(f"{method}: not available on this RPC tier "
+                               f"(x-ratelimit-method-limit: 0); use a dedicated RPC provider")
             if r.status_code == 200:
                 data = r.json()
-                if "result" in data:
+                if isinstance(data, dict) and "result" in data:
                     return data["result"]
-                err = data.get("error") or {}
-                last = f"rpc error {err.get('code')}: {err.get('message')}"
-                if r.headers.get("x-ratelimit-method-limit") == "0":
-                    raise RpcError(f"{method}: not available on this RPC tier "
-                                   f"(x-ratelimit-method-limit: 0); use a dedicated RPC provider")
+                err = (data.get("error") if isinstance(data, dict) else None) or {}
+                last = f"rpc error {err.get('code')}: {str(err.get('message'))[:120]}"
                 if err.get("code") != 429:  # not a rate limit: retrying will not help
                     raise RpcError(f"{method}: {last}")
             else:
-                last = f"HTTP {r.status_code}"
+                last = f"HTTP {r.status_code} from {host}"
                 if r.status_code not in (429, 403) and r.status_code < 500:
                     raise RpcError(f"{method}: {last}")
         except (requests.RequestException, ValueError) as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        log.warning("%s failed (%s), retry %d/%d", method, last, attempt + 1, retries)
-        backoff_sleep(attempt, retry_after=retry_after)
+            last = f"{type(exc).__name__} talking to {host}"  # never str(exc): it can echo the URL and key
+        if attempt + 1 < retries:
+            log.warning("%s failed (%s), retry %d/%d", method, last, attempt + 1, retries)
+            backoff_sleep(attempt, retry_after=retry_after)
     raise RpcError(f"{method}: {last}")
 
 
@@ -79,10 +82,17 @@ def mint_info(session, url: str, mint: str) -> dict:
     if not parsed or parsed.get("type") != "mint":
         return {"mint_authority": UNREADABLE, "freeze_authority": UNREADABLE,
                 "decimals": None, "supply": None, "token_program": acct.get("owner")}
-    info = parsed["info"]
-    return {"mint_authority": info.get("mintAuthority"), "freeze_authority": info.get("freezeAuthority"),
+    info = parsed["info"]  # a disabled authority is an explicit JSON null; an absent key is unknown
+    return {"mint_authority": info.get("mintAuthority", UNREADABLE),
+            "freeze_authority": info.get("freezeAuthority", UNREADABLE),
             "decimals": info.get("decimals"), "supply": float(info["supply"]) if info.get("supply") else None,
             "token_program": acct.get("owner")}
+
+
+def token_supply(session, url: str, mint: str) -> float:
+    """Raw supply via getTokenSupply (used when the mint account could not be parsed)."""
+    value = rpc_call(session, url, "getTokenSupply", [mint])
+    return float(value["value"]["amount"])
 
 
 def largest_holders(session, url: str, mint: str) -> list[dict]:
@@ -140,23 +150,22 @@ def lp_from_rugcheck(report: dict | None, pair_address: str | None) -> tuple[str
 
 def holders_from_rugcheck(report: dict | None, ignored: set[str]) -> tuple[float | None, float | None]:
     """Fallback holder shares from RugCheck's topHolders when the RPC refuses us."""
-    holders = [h for h in (report or {}).get("topHolders") or []
-               if h.get("owner") not in ignored and h.get("address") not in ignored]
-    if not holders:
-        return None, None
-    pcts = []
-    for h in holders:
-        if h.get("pct") is None:
+    totals: dict[str, float] = {}  # per owner wallet, like checks.holder_shares
+    for h in (report or {}).get("topHolders") or []:
+        if not isinstance(h, dict) or h.get("owner") in ignored or h.get("address") in ignored:
+            continue
+        key = h.get("owner") or h.get("address")
+        if not key or h.get("pct") is None:
             continue
         try:
             pct = float(h["pct"])
         except (TypeError, ValueError):
             continue
         if 0 <= pct <= 100:
-            pcts.append(pct / 100)
-    if not pcts:
+            totals[key] = totals.get(key, 0.0) + pct / 100
+    if not totals:
         return None, None
-    pcts.sort(reverse=True)
+    pcts = sorted(totals.values(), reverse=True)
     return pcts[0], min(1.0, sum(pcts[:10]))
 
 
@@ -179,7 +188,8 @@ def gather(session, rpc_url: str, mint: str, snapshot: dict, use_rugcheck: bool 
 
     token: dict = {"liquidity_usd": snapshot.get("liquidity_usd"),
                    "pool_age_minutes": snapshot.get("pool_age_minutes"),
-                   "mint_authority": UNREADABLE, "freeze_authority": UNREADABLE,
+                   "mint_authority": UNREADABLE, "freeze_authority": UNREADABLE, "authority_source": None,
+                   "supply": None, "token_program": None,
                    "largest_holder_share": None, "top10_share": None, "holder_source": None,
                    "lp_status": "UNKNOWN", "lp_locked_pct": None, "errors": []}
     report = rugcheck_report(session, mint) if use_rugcheck else None
@@ -187,13 +197,23 @@ def gather(session, rpc_url: str, mint: str, snapshot: dict, use_rugcheck: bool 
 
     try:
         token.update(mint_info(session, rpc_url, mint))
+        if token["mint_authority"] != UNREADABLE:
+            token["authority_source"] = "rpc"
     except RpcError as exc:
         token["errors"].append(str(exc))
-        if report and isinstance(report.get("token"), dict):  # fallback: RugCheck read the mint too
-            t = report["token"]
-            token.update({"mint_authority": normalize_authority(t.get("mintAuthority")),
-                          "freeze_authority": normalize_authority(t.get("freezeAuthority")),
-                          "supply": t.get("supply"), "token_program": report.get("tokenProgram")})
+        t = report.get("token") if report else None
+        if isinstance(t, dict):  # fallback: RugCheck read the mint too. Absent key = unknown, never "disabled".
+            token.update({
+                "mint_authority": normalize_authority(t["mintAuthority"]) if "mintAuthority" in t else UNREADABLE,
+                "freeze_authority": normalize_authority(t["freezeAuthority"]) if "freezeAuthority" in t else UNREADABLE,
+                "supply": t.get("supply"), "token_program": report.get("tokenProgram")})
+            if token["mint_authority"] != UNREADABLE:
+                token["authority_source"] = "rugcheck"
+    if token.get("supply") is None:
+        try:
+            token["supply"] = token_supply(session, rpc_url, mint)
+        except RpcError as exc:
+            token["errors"].append(str(exc))
 
     try:
         holders = largest_holders(session, rpc_url, mint)

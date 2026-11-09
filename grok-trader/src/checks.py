@@ -38,19 +38,31 @@ def holder_shares(holders: list[dict], supply: float | None,
     """Return (largest_single_share, top10_share) as fractions of supply.
 
     `holders` items need an "amount" (raw integer string or number) and may carry
-    an "owner" wallet; accounts owned by a liquidity pool or burn address are
-    skipped. Returns (None, None) when the data cannot be trusted.
+    an "owner" wallet. Amounts are summed per owner wallet, so a deployer who
+    splits a bag across many token accounts is still one holder. Accounts owned
+    by a liquidity pool or burn address are skipped. (None, None) = no data.
     """
-    if not holders or not supply or float(supply) <= 0:
+    try:
+        supply = float(supply) if supply is not None else 0.0
+    except (TypeError, ValueError):
+        return None, None
+    if not holders or supply <= 0:
         return None, None
     ignored = DEFAULT_IGNORED_OWNERS if ignored_owners is None else ignored_owners
-    amounts = sorted(
-        (float(h.get("amount") or 0) for h in holders if h.get("owner") not in ignored),
-        reverse=True,
-    )
+    totals: dict[str, float] = {}  # one wallet may spread its bag over many token accounts
+    for h in holders:
+        owner = h.get("owner") or h.get("address")
+        if not owner or owner in ignored or h.get("address") in ignored:
+            continue
+        try:
+            amount = float(h.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            totals[owner] = totals.get(owner, 0.0) + amount
+    amounts = sorted(totals.values(), reverse=True)
     if not amounts:
         return None, None
-    supply = float(supply)
     return amounts[0] / supply, min(1.0, sum(amounts[:10]) / supply)
 
 

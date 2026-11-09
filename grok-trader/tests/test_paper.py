@@ -76,3 +76,12 @@ def test_summary_shape(tmp_path):
     for key in ("balance_usd", "equity_usd", "open_positions", "wins", "losses", "avg_win_usd",
                 "avg_loss_usd", "biggest_loss_usd", "realized_pnl_usd", "today_realized_pnl_usd", "halted_today"):
         assert key in s
+
+
+def test_new_day_starts_from_pre_trade_equity(tmp_path):
+    b = broker(tmp_path, max_position_pct=0.5)
+    b.open("A", "A", 1.0, T0)  # $500 position, equity 1000
+    rec = b.mark("A", 0.5, T0 + timedelta(days=1))  # first event of day 2 is a big stop-out
+    assert rec["reason"] == "stop_loss"
+    day2 = b.state["days"][(T0 + timedelta(days=1)).date().isoformat()]
+    assert day2["start_equity"] == pytest.approx(1000.0) and day2["halted"] is True

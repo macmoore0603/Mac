@@ -53,21 +53,50 @@ def test_buy_signal_respects_broker_limits(tmp_path, cfg):
 
 def test_cycle_logs_errors_and_marks_tokens_seen(tmp_path, cfg, monkeypatch):
     bot = Bot(cfg, paths(tmp_path), grok_fn=lambda p: None, price_fn=lambda m: None, now_fn=lambda: T0)
-    monkeypatch.setattr(feed, "latest_solana_tokens", lambda s: ["GOOD", "BOOM"])
-    monkeypatch.setattr(feed, "token_pairs", lambda s, m: [] if m == "GOOD" else (_ for _ in ()).throw(RuntimeError("feed exploded")))
+    good, boom = "GoodToken1111111111111111111111111111111", "BoomToken1111111111111111111111111111111"
+    monkeypatch.setattr(feed, "latest_solana_tokens", lambda s: [good, boom, "not-a-mint"])
+    monkeypatch.setattr(feed, "token_pairs", lambda s, m: [] if m == good else (_ for _ in ()).throw(RuntimeError("feed exploded")))
     monkeypatch.setattr(onchain, "gather", lambda *a, **k: ({"mint_authority": None, "errors": []}, None))
     bot.cycle()
     rows = [json.loads(l) for l in open(tmp_path / "d.jsonl")]
     assert [r["action"] for r in rows] == ["skip", "error"] and "feed exploded" in rows[1]["reason"]
-    assert "GOOD" in bot.seen and "BOOM" in bot.seen
+    assert good in bot.seen and boom in bot.seen
+    assert "not-a-mint" in bot.seen and all(r["token"] != "not-a-mint" for r in rows)  # malformed: skipped quietly
     bot.cycle()  # nothing new: no extra rows
     assert len(open(tmp_path / "d.jsonl").readlines()) == 2
 
 
-def test_feed_outage_does_not_crash_cycle(tmp_path, cfg, monkeypatch):
+def test_feed_outage_is_journaled_not_fatal(tmp_path, cfg, monkeypatch):
     bot = Bot(cfg, paths(tmp_path), price_fn=lambda m: None, now_fn=lambda: T0)
     monkeypatch.setattr(feed, "latest_solana_tokens", lambda s: (_ for _ in ()).throw(feed.FeedError("down")))
     bot.cycle()
+    rows = [json.loads(l) for l in open(tmp_path / "d.jsonl")]
+    assert rows[0]["action"] == "error" and rows[0]["token"] is None and "down" in rows[0]["reason"]
+
+
+def test_config_rejects_dangerous_values(tmp_path):
+    base = json.load(open(main.os.path.join(main.ROOT, "config.json")))
+    for key, bad in (("stop_loss_pct", 1.5), ("max_position_pct", 0), ("grok_max_risk", 11),
+                     ("poll_interval_seconds", "60"), ("max_single_holder", True)):
+        (tmp_path / "c.json").write_text(json.dumps({**base, key: bad}))
+        with pytest.raises(SystemExit):
+            load_config(str(tmp_path / "c.json"))
+    base.pop("lp_provider")
+    (tmp_path / "c.json").write_text(json.dumps(base))
+    assert load_config(str(tmp_path / "c.json"))["lp_provider"] == "rugcheck"
+
+
+def test_dashboard_refuses_foreign_host_headers_and_bad_log_lines(tmp_path, cfg):
+    from dashboard import create_app
+    bot = Bot(cfg, paths(tmp_path), price_fn=lambda m: None, now_fn=lambda: T0)
+    mint, _, _, snapshot, token, _ = DEMO_TOKENS[1]
+    bot.process_token(mint, dict(snapshot), dict(token), None)
+    with open(tmp_path / "d.jsonl", "a") as fh:
+        fh.write("null\n[1, 2]\n{broken\n")
+    client = create_app(bot).test_client()
+    assert client.get("/").status_code == 200 and client.get("/api/state").status_code == 200
+    assert client.get("/api/state", headers={"Host": "attacker-rebind.example"}).status_code == 400
+    assert client.get("/", headers={"Host": "localhost:8000"}).status_code == 200
 
 
 def test_dashboard_renders(tmp_path, cfg):

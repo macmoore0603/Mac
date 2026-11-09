@@ -1,3 +1,5 @@
+import pytest
+
 import checks
 from checks import PASS, FAIL, UNKNOWN, UNREADABLE, evaluate, all_pass, holder_shares, not_passed
 
@@ -21,9 +23,7 @@ def test_unknown_never_counts_as_pass():
         unknown = UNREADABLE if key in ("mint_authority", "freeze_authority") else None
         results = evaluate({**GOOD, key: unknown}, CFG)
         assert not all_pass(results), key
-        assert all(r.status != PASS for r in results if r.value is None and r.name != "mint_authority"
-                   and r.name != "freeze_authority") or True
-    assert status("lp_locked", {**GOOD, "lp_locked_pct": None}) == UNKNOWN
+        assert status("lp_locked", {**GOOD, "lp_locked_pct": None}) == UNKNOWN
     assert status("mint_authority", {**GOOD, "mint_authority": UNREADABLE}) == UNKNOWN
     assert status("liquidity", {k: v for k, v in GOOD.items() if k != "liquidity_usd"}) == UNKNOWN
 
@@ -72,3 +72,13 @@ def test_not_passed_names_statuses():
     results = evaluate({**GOOD, "liquidity_usd": 1, "lp_status": "UNKNOWN"}, CFG)
     assert not_passed(results) == ["liquidity=FAIL", "lp_locked=UNKNOWN"]
     assert results[0].to_dict()["status"] == FAIL
+
+
+def test_holder_shares_sum_token_accounts_per_wallet():
+    split = [{"address": f"a{i}", "amount": "19", "owner": "WHALE"} for i in range(20)]  # 38% in 20 accounts
+    pool = [{"address": "pool", "amount": "620", "owner": next(iter(checks.DEFAULT_IGNORED_OWNERS))}]
+    largest, top10 = holder_shares(split + pool, 1000)
+    assert largest == pytest.approx(0.38) and top10 == pytest.approx(0.38)
+    unknown_owner = [{"address": "x", "amount": "50", "owner": None}, {"address": "y", "amount": "50", "owner": None}]
+    assert holder_shares(unknown_owner, 1000) == (0.05, 0.10)  # no owner: each account is its own wallet
+    assert holder_shares([{"address": "z", "amount": "abc", "owner": "w"}], 1000) == (None, None)

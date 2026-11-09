@@ -91,6 +91,7 @@ def test_gather_falls_back_to_rugcheck_holders_when_rpc_refuses():
     token, report = onchain.gather(s, RPC, MINT, {"liquidity_usd": 5.0, "pool_age_minutes": 2.0, "pair_address": "PAIR1"})
     assert report is REPORT and token["mint_authority"] is None and token["freeze_authority"] == "Frz"
     assert token["holder_source"] == "rugcheck" and token["largest_holder_share"] == pytest.approx(0.045)
+    assert token["authority_source"] == "rpc"
     assert token["lp_status"] == "LOCKED" and token["lp_locked_pct"] == 100.0
     assert token["liquidity_usd"] == 5.0 and any("not available" in e for e in token["errors"])
 
@@ -99,7 +100,8 @@ def test_gather_with_everything_down_stays_unknown():
     s = FakeSession({("GET", "rugcheck"): [FakeResponse(503)], ("POST", RPC): [FakeResponse(503)]})
     token, report = onchain.gather(s, RPC, MINT, {"pair_address": None})
     assert report is None and token["mint_authority"] == UNREADABLE and token["largest_holder_share"] is None
-    assert token["lp_status"] == "UNKNOWN" and token["holder_source"] is None and len(token["errors"]) == 2
+    assert token["lp_status"] == "UNKNOWN" and token["holder_source"] is None and len(token["errors"]) == 3
+    assert token["authority_source"] is None and any("getTokenSupply" in e for e in token["errors"])
 
 
 def test_rugcheck_report_must_be_an_object():
@@ -126,3 +128,49 @@ def test_rpc_call_passes_retry_after_to_backoff(monkeypatch):
     monkeypatch.setattr(onchain, "backoff_sleep", lambda attempt, **kw: seen.append(kw.get("retry_after")))
     s = FakeSession({("POST", RPC): [FakeResponse(429, headers={"Retry-After": "10"}), rpc_ok({"v": 1})]})
     assert onchain.rpc_call(s, RPC, "m", []) == {"v": 1} and seen == ["10"]
+
+
+def test_http_429_with_method_limit_zero_fails_fast_too():
+    s = FakeSession({("POST", RPC): [FakeResponse(429, {"error": {"code": 429}}, headers={"x-ratelimit-method-limit": "0", "Retry-After": "10"})]})
+    with pytest.raises(onchain.RpcError, match="not available on this RPC tier"):
+        onchain.rpc_call(s, RPC, "getTokenLargestAccounts", [MINT])
+    assert len(s.calls) == 1
+
+
+def test_rpc_errors_never_echo_the_provider_url():
+    import requests
+    secret_url = "https://rpc.example.com/?api-key=sk_live_SUPERSECRET"
+    boom = requests.ConnectionError(f"HTTPSConnectionPool: Max retries exceeded with url: {secret_url}")
+    s = FakeSession({("POST", "rpc.example.com"): [boom]})
+    with pytest.raises(onchain.RpcError) as info:
+        onchain.rpc_call(s, secret_url, "getAccountInfo", [MINT], retries=2)
+    assert "SUPERSECRET" not in str(info.value) and "rpc.example.com" in str(info.value)
+
+
+def test_rugcheck_fallback_without_authority_keys_stays_unknown():
+    partial = {**REPORT, "token": {"supply": 1000, "decimals": 6}}
+    s = FakeSession({("GET", "rugcheck"): [FakeResponse(200, partial)], ("POST", RPC): [FakeResponse(503)]})
+    token, _ = onchain.gather(s, RPC, MINT, {"pair_address": "PAIR1"})
+    assert token["mint_authority"] == UNREADABLE and token["freeze_authority"] == UNREADABLE
+    assert token["authority_source"] is None
+    labelled = {**REPORT, "token": {"mintAuthority": None, "freezeAuthority": None, "supply": 1000}}
+    s = FakeSession({("GET", "rugcheck"): [FakeResponse(200, labelled)], ("POST", RPC): [FakeResponse(503)]})
+    token, _ = onchain.gather(s, RPC, MINT, {"pair_address": "PAIR1"})
+    assert token["mint_authority"] is None and token["authority_source"] == "rugcheck"
+
+
+def test_mint_info_without_authority_keys_is_unreadable_and_supply_falls_back():
+    odd = {"value": {"owner": "Tokenkeg", "data": {"parsed": {"type": "mint", "info": {"decimals": 6}}}}}
+    s = FakeSession({("GET", "rugcheck"): [FakeResponse(404)],
+                     ("POST", RPC): [rpc_ok(odd), rpc_ok({"value": {"amount": "5000", "decimals": 6}}),
+                                     rpc_err(headers={"x-ratelimit-method-limit": "0"})]})
+    token, _ = onchain.gather(s, RPC, MINT, {"pair_address": None})
+    assert token["mint_authority"] == UNREADABLE and token["supply"] == 5000.0
+    assert [c[2]["json"]["method"] for c in s.calls if c[0] == "POST"][:2] == ["getAccountInfo", "getTokenSupply"]
+
+
+def test_rugcheck_holders_are_summed_per_wallet():
+    split = {"topHolders": [{"address": f"a{i}", "owner": "WHALE", "pct": 3.0} for i in range(5)]
+             + [{"address": "b", "owner": "small", "pct": 2.0}]}
+    largest, top10 = onchain.holders_from_rugcheck(split, set())
+    assert largest == pytest.approx(0.15) and top10 == pytest.approx(0.17)

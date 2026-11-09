@@ -71,9 +71,10 @@ def get_json(session: requests.Session, url: str, *, limiter: RateLimiter | None
             if r.status_code not in (429, 403) and r.status_code < 500:
                 break
         except (requests.RequestException, json.JSONDecodeError) as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        log.warning("GET %s failed (%s), retry %d/%d", url, last, attempt + 1, retries)
-        backoff_sleep(attempt, retry_after=retry_after)
+            last = type(exc).__name__  # never str(exc): request errors can echo URLs
+        if attempt + 1 < retries:
+            log.warning("GET %s failed (%s), retry %d/%d", url, last, attempt + 1, retries)
+            backoff_sleep(attempt, retry_after=retry_after)
     raise FeedError(f"GET {url}: {last}")
 
 
@@ -83,9 +84,15 @@ _pairs_limiter = RateLimiter(300)
 
 def latest_solana_tokens(session: requests.Session) -> list[str]:
     """Token addresses from the latest-profiles feed, Solana only, newest first."""
-    data = get_json(session, PROFILES_URL, limiter=_profiles_limiter) or []
+    data = get_json(session, PROFILES_URL, limiter=_profiles_limiter)
+    if data is None:
+        return []
+    if not isinstance(data, list):  # an error or maintenance object instead of the feed
+        raise FeedError(f"unexpected profiles payload: {type(data).__name__}")
     seen, out = set(), []
     for item in data:
+        if not isinstance(item, dict):
+            continue
         addr = item.get("tokenAddress")
         if item.get("chainId") == "solana" and addr and addr not in seen:
             seen.add(addr)
@@ -95,7 +102,8 @@ def latest_solana_tokens(session: requests.Session) -> list[str]:
 
 def token_pairs(session: requests.Session, mint: str) -> list[dict]:
     url = PAIRS_URL.format(chain="solana", token=mint)
-    return get_json(session, url, limiter=_pairs_limiter) or []
+    pairs = get_json(session, url, limiter=_pairs_limiter)
+    return [p for p in pairs if isinstance(p, dict)] if isinstance(pairs, list) else []
 
 
 def main_pool(pairs: list[dict], mint: str | None = None) -> dict | None:
@@ -111,8 +119,8 @@ def main_pool(pairs: list[dict], mint: str | None = None) -> dict | None:
         pairs = base or pairs
 
     def liq(p):
-        v = (p.get("liquidity") or {}).get("usd")
-        return float(v) if v is not None else -1.0
+        v = _num((p.get("liquidity") or {}).get("usd"))
+        return v if v is not None else -1.0
 
     return max(pairs, key=liq)
 
@@ -130,6 +138,8 @@ def pool_snapshot(pair: dict | None, now_ms: int) -> dict:
         return {"pair_address": None, "liquidity_usd": None, "pool_age_minutes": None,
                 "price_usd": None, "symbol": "?", "name": "?"}
     created = pair.get("pairCreatedAt")  # milliseconds since epoch
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        created = None
     base = pair.get("baseToken") or {}
     return {
         "pair_address": pair.get("pairAddress"),
@@ -162,8 +172,12 @@ class SeenCache:
         self.path, self.keep = path, keep
         self.seen: dict[str, str] = {}
         if os.path.exists(path):
-            with open(path, encoding="utf-8") as fh:
-                self.seen = json.load(fh)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                self.seen = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                log.warning("seen-token cache %s is unreadable; starting empty", path)
 
     def __contains__(self, mint: str) -> bool:
         return mint in self.seen
@@ -174,5 +188,7 @@ class SeenCache:
             for old in list(self.seen)[: len(self.seen) - self.keep]:
                 del self.seen[old]
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as fh:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.seen, fh)
+        os.replace(tmp, self.path)  # atomic, like the paper state

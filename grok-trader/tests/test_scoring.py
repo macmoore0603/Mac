@@ -34,3 +34,8 @@ def test_score_is_informational_and_monotonic():
     assert score(OK, None) == 60
     assert score(BAD, None) < 60
     assert score([], GROK) == 0
+
+
+def test_boolean_risk_is_not_a_number():
+    assert decide(OK, {**GROK, "risk": True}, CFG).action == SKIP
+    assert score(OK, {**GROK, "risk": True}) == 60

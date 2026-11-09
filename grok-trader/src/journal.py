@@ -33,16 +33,18 @@ def tail(path: str, n: int = 50) -> list[dict]:
     if not os.path.exists(path):
         return []
     last: deque[str] = deque(maxlen=n)
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             if line.strip():
                 last.append(line)
     out = []
     for line in last:
         try:
-            out.append(json.loads(line))
+            obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(obj, dict):
+            out.append(obj)
     return out
 
 
@@ -53,7 +55,8 @@ def summarize(records: list[dict]) -> dict:
     grok_calls, grok_cost = 0, 0.0
     for r in records:
         for c in r.get("checks") or []:
-            checks.setdefault(c["name"], Counter())[c["status"]] += 1
+            if isinstance(c, dict) and "name" in c and "status" in c:
+                checks.setdefault(str(c["name"]), Counter())[str(c["status"])] += 1
         g = r.get("grok")
         if isinstance(g, dict) and g.get("usage"):
             grok_calls += 1

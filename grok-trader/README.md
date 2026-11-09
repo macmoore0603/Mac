@@ -40,8 +40,10 @@ Open `.env` in a text editor and fill it in:
 | `SOLANA_RPC_URL` | The Solana node the bot reads holders and mint data from. The public default works but is shared and limited (see section 8). | Free public: `https://api.mainnet.solana.com` (the older `api.mainnet-beta.solana.com` name serves the same node). Dedicated providers (Helius, QuickNode, Triton, etc.) give a URL with a key in it. |
 | `MODE` | Must be `paper`. | - |
 
-`.env` is listed in `.gitignore`, so git will never pick it up. Never paste a
-key into a prompt, screenshot or chat.
+`.env` and every `.env.*` variant (`.env.local`, `.env.bak`, ...) are listed in
+`.gitignore`, so git will never pick them up. Never paste a key into a prompt,
+screenshot or chat. If your RPC URL carries a provider key, note that the bot
+logs only the host name on errors, never the full URL.
 
 ## 3. Run it
 
@@ -98,7 +100,7 @@ JSON.
 | `checks` | Every hard rule with `status` (PASS / FAIL / UNKNOWN), the value seen and the rule |
 | `grok` | Grok's reply (`risk`, `reasons`, `missing_data`) or `null` if the token never reached Grok |
 | `score`, `reason` | The 0-100 convenience score and the one-line reason for the action |
-| `market`, `holders`, `authorities`, `lp`, `rugcheck` | The raw numbers the decision used |
+| `market`, `holders`, `authorities`, `lp`, `rugcheck` | The raw numbers the decision used. `holders.holder_source` and `authorities.authority_source` say where each came from: `rpc`, `rugcheck`, or `null` when nothing could read it |
 | `data_errors` | Anything a data source refused to tell us |
 | `trade` (sells only) | Entry, exit, P&L, and whether it was `stop_loss` or `take_profit` |
 
@@ -123,7 +125,7 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 | `max_new_tokens_per_cycle` | 10 | Cap on tokens scored per cycle (keeps API usage polite) |
 | `min_liquidity_usd` | 25000 | Main pool must hold at least this much |
 | `min_pool_age_minutes` | 10 | Pool must be at least this old |
-| `max_single_holder` | 0.10 | Largest wallet (pools excluded) may hold at most 10% |
+| `max_single_holder` | 0.10 | Largest wallet (pools excluded) may hold at most 10%; token accounts are summed per owner wallet |
 | `max_top10_share` | 0.40 | Top-10 wallets (pools excluded) at most 40% |
 | `require_mint_disabled` | true | Mint authority must be null (supply cannot be inflated) |
 | `require_freeze_disabled` | true | Freeze authority must be null (your tokens cannot be frozen) |
@@ -147,7 +149,7 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 
 1. **New token appears**: DEX Screener's latest token profiles, Solana only, each token scored once.
 2. **Pool data**: DEX Screener token pairs; the pool with the most USD liquidity is "the" pool.
-3. **On-chain reads** (Solana RPC): mint authority, freeze authority, supply, the 20 largest token accounts and who owns them.
+3. **On-chain reads** (Solana RPC): mint authority, freeze authority and supply from the parsed mint account (`getTokenSupply` as the fallback when the mint cannot be parsed), the 20 largest token accounts and who owns them, summed per owner wallet.
 4. **LP / rug signals** (RugCheck): LP locked %, which large accounts are pools, RugCheck's own risk list.
 5. **Hard rules**: the table below. **Any FAIL = skip. UNKNOWN never counts as PASS.**
 6. **Grok**: only an all-PASS token is sent, with the raw numbers, and asked for `{"risk": 0-10, "reasons": [...], "missing_data": [...]}`. The reply is treated as data; nothing in it is ever executed.
@@ -169,7 +171,7 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 ## 8. Honest limits you should know about
 
 - **The free public Solana RPC does not serve `getTokenLargestAccounts`.** It answers a JSON-RPC 429 with the header `x-ratelimit-method-limit: 0` on the free tier (checked live, repeatedly, on both hostnames). The bot detects this, logs it in `data_errors`, and uses RugCheck's top-holder list instead, marked `holder_source: "rugcheck"` in the log. A dedicated RPC URL in `.env` gives you RPC-sourced holder data.
-- **RugCheck does a lot of work here**: LP lock percentage, identifying which big accounts are AMM pools (so the Raydium or pump.fun vault does not count as a "whale"), fallback holder shares, and fallback mint data. If RugCheck is down, LP becomes UNKNOWN and every token is skipped. That is the intended fail-safe direction. Its documented rate limit was not found; the response header advertises a limit of 15, so the bot spaces calls and backs off on 429.
+- **RugCheck does a lot of work here**: LP lock percentage, identifying which big accounts are AMM pools (so the Raydium or pump.fun vault does not count as a "whale"), fallback holder shares, and fallback mint data. If RugCheck is down, LP becomes UNKNOWN and every token is skipped. That is the intended fail-safe direction. Its documented anonymous limit is 1 request per second (the response header advertises a bucket of 15), so the bot spaces calls at that rate and backs off on 429.
 - **pump.fun bonding-curve tokens** have no liquidity figure on DEX Screener (`liquidity: null`), so they fail the liquidity rule until they graduate to a real pool. Expect many skips for that reason.
 - **Paper fills are optimistic.** A 1% haircut per side is applied, but a real thin pool moves against you when you trade it, and fees vary. Treat paper results as "the code runs", not "the strategy works".
 - **Each token is scored once**, including tokens that errored. The feed shows the same tokens for a long time, so this keeps API usage small; it also means a transient outage can make the bot skip a token for good.
@@ -226,6 +228,11 @@ grok-trader/
   src/dashboard.py   One-page Flask dashboard (read-only)
   tests/             pytest suite, offline
   config.json        Every threshold and risk limit
+
+About 850 code lines in src/ against the guide's "~600" target: the extra is
+retries and backoff, the RugCheck fallbacks, the Host-header guard on the
+dashboard, and the demo fixtures. Two helper modules (onchain.py, journal.py)
+exist beyond the guide's file list so that each file stays single-purpose.
   .env.example       Placeholder keys
   data/              Paper state and seen-token cache (created on first run, git-ignored)
   logs/              decisions.jsonl (created on first run, git-ignored)

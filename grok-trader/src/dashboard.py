@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, abort, jsonify, render_template_string, request
 
 import journal
 
@@ -51,6 +52,14 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 def create_app(bot) -> Flask:
     app = Flask(__name__)
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    loopback = {"localhost", "127.0.0.1", "::1"}
+    bound = bot.cfg.get("dashboard_host", "127.0.0.1")
+
+    @app.before_request
+    def only_local_hosts():
+        # DNS-rebinding guard: while we only listen on loopback, only loopback host names are served.
+        if bound in loopback and urlsplit("//" + request.host).hostname not in loopback:
+            abort(400)
 
     def state():
         with bot.lock:

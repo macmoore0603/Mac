@@ -90,3 +90,30 @@ def test_get_json_passes_retry_after(monkeypatch):
     monkeypatch.setattr(feed, "backoff_sleep", lambda attempt, **kw: seen.append(kw.get("retry_after")))
     s = FakeSession({("GET", "x"): [FakeResponse(429, headers={"Retry-After": "3"}), FakeResponse(200, {"ok": 1})]})
     assert feed.get_json(s, "https://x/") == {"ok": 1} and seen == ["3"]
+
+
+def test_feed_payload_shape_is_checked():
+    s = FakeSession({("GET", "token-profiles/latest"): [FakeResponse(200, {"message": "maintenance"})]})
+    with pytest.raises(feed.FeedError):
+        feed.latest_solana_tokens(s)
+    junk = [None, "oops", {"chainId": "solana", "tokenAddress": "A"}, 42]
+    assert feed.latest_solana_tokens(FakeSession({("GET", "token-profiles/latest"): [FakeResponse(200, junk)]})) == ["A"]
+    assert feed.token_pairs(FakeSession({("GET", "token-pairs"): [FakeResponse(200, {"pairs": []})]}), "M") == []
+    assert feed.token_pairs(FakeSession({("GET", "token-pairs"): [FakeResponse(200, [None, pair(1)])]}), "M") == [pair(1)]
+
+
+def test_seen_cache_survives_a_corrupt_file(tmp_path):
+    path = tmp_path / "seen.json"
+    path.write_text('{"a": "t", "b"')
+    c = feed.SeenCache(str(path))
+    assert c.seen == {}
+    c.add("x", "t")
+    assert feed.SeenCache(str(path)).seen == {"x": "t"} and not (tmp_path / "seen.json.tmp").exists()
+
+
+def test_get_json_does_not_sleep_after_the_last_attempt(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(feed, "backoff_sleep", lambda attempt, **kw: sleeps.append(attempt))
+    with pytest.raises(feed.FeedError):
+        feed.get_json(FakeSession({("GET", "x"): [FakeResponse(503)]}), "https://x/", retries=3)
+    assert sleeps == [0, 1]
