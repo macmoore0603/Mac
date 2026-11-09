@@ -57,8 +57,8 @@ python src/main.py --demo
 
 Expected: `BUY SAFEPUP`, `SKIP RUGLORD`, `SKIP THINPOOL`, then
 `SELL SAFEPUP stop_loss`, and `DEMO PASSED`. The demo writes to separate files
-(`logs/decisions.demo.jsonl`, `data/paper_state.demo.json`) so it never mixes
-with your real paper record.
+(`logs/decisions.demo.jsonl`, `data/paper_state.demo.json`,
+`data/seen_tokens.demo.json`) so it never mixes with your real paper record.
 
 **Paper mode** (live market data, fake money):
 
@@ -66,7 +66,8 @@ with your real paper record.
 python src/main.py --mode paper
 ```
 
-Leave it running. Every 60 seconds it pulls the newest Solana tokens, scores
+Leave it running. At least every 60 seconds (a cycle can take longer while it
+waits politely on the data providers) it pulls the newest Solana tokens, scores
 up to 10 of them, checks the stop-loss and take-profit of anything it holds,
 and prints one line per decision. Stop it with `Ctrl+C`; the paper account is
 saved after every trade, so you can restart any time.
@@ -83,8 +84,8 @@ Useful flags:
 
 While the bot runs, open **http://localhost:8000**. It shows the paper balance,
 equity, realised P&L, today's P&L (and whether the daily loss limit tripped),
-open positions with their stop and target, PASS/FAIL/UNKNOWN counts per rule,
-and the last 50 decisions. It refreshes itself every 30 seconds and only
+open positions with their stop and target, average win and loss, PASS/FAIL/UNKNOWN
+counts per rule (all time), and the last 50 decisions. It refreshes itself every 30 seconds and only
 listens on your own machine (127.0.0.1). `/api/state` gives the same data as
 JSON.
 
@@ -111,9 +112,9 @@ python -c "import json;[print(r['ts'],r['action'],r.get('symbol'),r['reason']) f
 ```
 
 What to review after a few days (guide section 8): win rate, average win vs
-average loss, biggest loss, how often the stop fired (all on the dashboard),
-and the tokens that passed every rule and then collapsed. Change one rule at a
-time.
+average loss, biggest loss and how often the stop fired (all on the dashboard,
+also in `/api/state` under `paper`), and the tokens that passed every rule and
+then collapsed. Change one rule at a time.
 
 ## 6. Change the rules: `config.json`
 
@@ -155,11 +156,11 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 6. **Grok**: only an all-PASS token is sent, with the raw numbers, and asked for `{"risk": 0-10, "reasons": [...], "missing_data": [...]}`. The reply is treated as data; nothing in it is ever executed.
 7. **Decision**: buy only if every rule PASSED and `risk <= grok_max_risk`. The 0-100 score is for the log and dashboard; it can never override a failed rule.
 8. **Paper trade**: 2% of balance, stop and target set at entry, checked every cycle.
-9. **Log**: every token gets a line, including skips and errors.
+9. **Log**: every token gets a line, including skips, errors, and feed entries that are not even a valid Solana address.
 
 | Rule | PASS | FAIL |
 |---|---|---|
-| Liquidity | >= $25,000 in the main pool | Below, or no liquidity figure |
+| Liquidity | >= $25,000 in the main pool | Below. No figure at all (a bonding curve, or a bad number) is UNKNOWN, which is also a skip |
 | Pool age | >= 10 minutes | Younger |
 | Largest holder | <= 10% of supply (pools and burn address excluded) | Any single wallet above |
 | Concentration | Top-10 <= 40% | Above |
@@ -172,7 +173,7 @@ No code changes needed. Tighten freely; loosen only after the logs say so.
 
 - **The free public Solana RPC does not serve `getTokenLargestAccounts`.** It answers a JSON-RPC 429 with the header `x-ratelimit-method-limit: 0` on the free tier (checked live, repeatedly, on both hostnames). The bot detects this, logs it in `data_errors`, and uses RugCheck's top-holder list instead, marked `holder_source: "rugcheck"` in the log. A dedicated RPC URL in `.env` gives you RPC-sourced holder data.
 - **RugCheck does a lot of work here**: LP lock percentage, identifying which big accounts are AMM pools (so the Raydium or pump.fun vault does not count as a "whale"), fallback holder shares, and fallback mint data. If RugCheck is down, LP becomes UNKNOWN and every token is skipped. That is the intended fail-safe direction. Its documented anonymous limit is 1 request per second (the response header advertises a bucket of 15), so the bot spaces calls at that rate and backs off on 429.
-- **pump.fun bonding-curve tokens** have no liquidity figure on DEX Screener (`liquidity: null`), so they fail the liquidity rule until they graduate to a real pool. Expect many skips for that reason.
+- **pump.fun bonding-curve tokens** have no liquidity figure on DEX Screener (the `liquidity` key is absent), so the liquidity rule is UNKNOWN for them and they are skipped until they graduate to a real pool. Expect many skips for that reason.
 - **Paper fills are optimistic.** A 1% haircut per side is applied, but a real thin pool moves against you when you trade it, and fees vary. Treat paper results as "the code runs", not "the strategy works".
 - **Each token is scored once**, including tokens that errored. The feed shows the same tokens for a long time, so this keeps API usage small; it also means a transient outage can make the bot skip a token for good.
 - **"Day" is the UTC calendar day** for the daily loss limit.
@@ -189,7 +190,7 @@ official documentation pages, while writing the code:
 | DEX Screener `GET /token-profiles/latest/v1` | Returns a list; `chainId`, `tokenAddress`, `url`, `icon`, `description`, `links`; documented 60 req/min; `cache-control: max-age=60`; no key |
 | DEX Screener `GET /token-pairs/v1/solana/{token}` | Returns a list of up to 30 pairs (no pagination); the token can be the base OR the quote side, so the bot keeps base-side pools; `pairAddress`, `dexId`, `priceUsd` (string), `liquidity.usd` (absent for bonding-curve pairs), `pairCreatedAt` (ms since epoch), `fdv`, `marketCap`, `volume.h24`, `txns.h1.buys/sells`; documented 300 req/min; unknown token returns `[]` |
 | Solana RPC | `https://api.mainnet.solana.com` is the documented public endpoint (`api.mainnet-beta.solana.com` resolves to the same node); `getTokenSupply`, `getAccountInfo` (jsonParsed: `data.parsed.info.mintAuthority / freezeAuthority / supply / decimals`, disabled authority is JSON `null`) for both the classic Token program and Token-2022; `getMultipleAccounts` for owners; `getTokenLargestAccounts` refused on the free tier (`x-ratelimit-method-limit: 0`, JSON-RPC error 429 inside HTTP 200); documented limits 100 req/10 s per IP, 40 per method |
-| RugCheck `GET /v1/tokens/{mint}/report` | No key needed; documented anonymous limit 1 request/second (headers advertise 15 per window); `markets[].lp.lpLockedPct`, `markets[].marketType`, `knownAccounts` (typed `AMM` / `CREATOR` / `LOCKER`), `topHolders[].owner/pct/insider` (can be `null`), `token.mintAuthority/freezeAuthority/supply`, `risks[].name/level`, `score_normalised`; `rugged` is deprecated and not used; garbage mint returns 400 |
+| RugCheck `GET /v1/tokens/{mint}/report` | No key needed; documented anonymous limit 1 request/second (headers advertise 15 per window); fields the bot reads: `markets[].pubkey` (equals the DEX Screener `pairAddress` for the same pool), `markets[].lp.lpLockedPct`, `markets[].lp.baseUSD/quoteUSD` (to pick the biggest market when no pubkey matches), `markets[].marketType`, `knownAccounts` (typed `AMM` / `CREATOR` / `LOCKER`), `topHolders[].owner/pct` (list can be `null`), `token.mintAuthority/freezeAuthority/supply`, `tokenProgram`, `totalHolders`, `risks[].name/level`, `score_normalised`; `rugged` is deprecated and not used; garbage mint returns 400 |
 | xAI | `POST https://api.x.ai/v1/chat/completions` with `Authorization: Bearer` (xAI now labels this endpoint legacy/deprecated in favour of `/v1/responses`, with no retirement date); model `grok-4.7` exists at $2 / 1M input and $6 / 1M output tokens, reasoning tokens billed as output (grok-4.3 is cheaper); `reasoning_effort` low/medium/high/xhigh; structured output via `response_format` `json_schema` (primary) or `json_object`; 401 with no credentials, **400 `invalid-argument` for a wrong key**, 429 for rate limits; reply at `choices[0].message.content`, a refusal at `choices[0].message.refusal`, exact cost at `usage.cost_in_usd_ticks` |
 
 Not verified here:
@@ -228,12 +229,13 @@ grok-trader/
   src/dashboard.py   One-page Flask dashboard (read-only)
   tests/             pytest suite, offline
   config.json        Every threshold and risk limit
-
-About 850 code lines in src/ against the guide's "~600" target: the extra is
-retries and backoff, the RugCheck fallbacks, the Host-header guard on the
-dashboard, and the demo fixtures. Two helper modules (onchain.py, journal.py)
-exist beyond the guide's file list so that each file stays single-purpose.
   .env.example       Placeholder keys
   data/              Paper state and seen-token cache (created on first run, git-ignored)
   logs/              decisions.jsonl (created on first run, git-ignored)
 ```
+
+Roughly 1,000 code lines in `src/` (about 1,350 with comments, docstrings and
+the dashboard template) against the guide's "~600" target. The extra is retries
+and backoff, the RugCheck fallbacks, input validation, the security guards and
+the demo fixtures. Two helper modules (`onchain.py`, `journal.py`) exist beyond
+the guide's file list so that each file stays single-purpose.

@@ -84,8 +84,8 @@ def parse_reply(text: str) -> dict:
         return {"risk": None, "reasons": [], "missing_data": [], "error": "risk missing or not 0-10"}
     risk = math.ceil(risk)  # a fractional risk rounds UP: 4.5 must not slip under a limit of 4
 
-    def strings(v):
-        return [str(x)[:300] for x in v if str(x).strip()][:10] if isinstance(v, list) else []
+    def strings(v):  # only real, non-blank strings count; null / 0 / {} are not reasons
+        return [x[:300] for x in v if isinstance(x, str) and x.strip()][:10] if isinstance(v, list) else []
 
     return {"risk": int(risk), "reasons": strings(obj.get("reasons")),
             "missing_data": strings(obj.get("missing_data")), "error": None}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -126,10 +127,14 @@ def main_pool(pairs: list[dict], mint: str | None = None) -> dict | None:
 
 
 def _num(v):
+    """float or None. NaN, infinity and overflowing literals count as 'no data'."""
+    if v is None or isinstance(v, bool):
+        return None
     try:
-        return float(v) if v is not None else None
+        x = float(v)
     except (TypeError, ValueError):
         return None
+    return x if math.isfinite(x) else None
 
 
 def pool_snapshot(pair: dict | None, now_ms: int) -> dict:

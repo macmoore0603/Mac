@@ -90,3 +90,12 @@ def test_payload_bounds_third_party_labels():
     assert len(payload["rugcheck"]["risks"]) == 10 and all(len(r) <= 80 for r in payload["rugcheck"]["risks"])
     assert payload["authorities"]["authority_source"] == "rpc"
     assert "untrusted" in grok.SYSTEM_PROMPT
+
+
+def test_non_string_reason_items_do_not_count_as_reasons():
+    from scoring import decide
+    from test_scoring import OK, CFG
+    for item in ("null", "0", "{}", "false", "[]"):
+        parsed = grok.parse_reply('{"risk": 1, "reasons": [%s], "missing_data": []}' % item)
+        assert parsed["reasons"] == [] and decide(OK, parsed, CFG).action == "skip", item
+    assert grok.parse_reply('{"risk": 1, "reasons": ["ok", 5, null]}')["reasons"] == ["ok"]

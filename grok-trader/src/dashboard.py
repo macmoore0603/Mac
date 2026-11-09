@@ -31,6 +31,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="tile"><small>Today</small><b>${{ "%.2f"|format(p.today_realized_pnl_usd) }}</b>
    {% if p.halted_today %}<small style="color:#c33">daily loss limit hit</small>{% endif %}</div>
  <div class="tile"><small>Closed trades</small><b>{{ p.closed_trades }}</b><small>{{ p.wins }} wins / {{ p.losses }} losses · {{ p.stop_losses_fired }} stops</small></div>
+ <div class="tile"><small>Avg win / avg loss</small><b>${{ "%.2f"|format(p.avg_win_usd) }} / ${{ "%.2f"|format(p.avg_loss_usd) }}</b><small>biggest loss ${{ "%.2f"|format(p.biggest_loss_usd) }}</small></div>
  <div class="tile"><small>Grok spend (logged)</small><b>${{ "%.4f"|format(stats.grok_cost_usd) }}</b><small>{{ stats.grok_calls }} calls</small></div>
 </div>
 <h2>Open positions ({{ p.open_positions|length }})</h2>
@@ -39,7 +40,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <td>{{ "%.8g"|format(o.entry_price) }}</td><td>{{ "%.8g"|format(o.last_price) }}</td><td>{{ "%.8g"|format(o.stop_price) }}</td>
 <td>{{ "%.8g"|format(o.take_profit_price) }}</td><td>${{ "%.2f"|format(o.cost_usd) }}</td><td>{{ o.opened_at }}</td></tr>
 {% else %}<tr><td colspan="7"><small>none</small></td></tr>{% endfor %}</table>
-<h2>Decisions ({{ stats.actions }})</h2>
+<h2>Decisions, all time: {% for k, v in stats.actions.items() %}{{ v }} {{ k }}{% if not loop.last %} · {% endif %}{% else %}none yet{% endfor %}</h2>
 <table><tr><th>Check</th>{% for s in ["PASS","FAIL","UNKNOWN"] %}<th>{{ s }}</th>{% endfor %}</tr>
 {% for name, c in stats.checks.items() %}<tr><td>{{ name }}</td>{% for s in ["PASS","FAIL","UNKNOWN"] %}<td>{{ c.get(s, 0) }}</td>{% endfor %}</tr>{% endfor %}</table>
 <h2>Last {{ decisions|length }} decisions</h2>
@@ -64,8 +65,8 @@ def create_app(bot) -> Flask:
     def state():
         with bot.lock:
             paper = bot.broker.summary(bot.now())
-        recent = journal.tail(bot.paths["log"], 1000)
-        return paper, recent[-50:], journal.summarize(recent)
+        records = journal.tail(bot.paths["log"], None)  # whole file: these counts are all-time totals
+        return paper, records[-50:], journal.summarize(records)
 
     @app.get("/")
     def index():

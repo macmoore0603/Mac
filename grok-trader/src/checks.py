@@ -6,6 +6,7 @@ PASS as a reason to skip the token.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, asdict
 
 PASS, FAIL, UNKNOWN = "PASS", "FAIL", "UNKNOWN"
@@ -46,7 +47,7 @@ def holder_shares(holders: list[dict], supply: float | None,
         supply = float(supply) if supply is not None else 0.0
     except (TypeError, ValueError):
         return None, None
-    if not holders or supply <= 0:
+    if not holders or not math.isfinite(supply) or supply <= 0:
         return None, None
     ignored = DEFAULT_IGNORED_OWNERS if ignored_owners is None else ignored_owners
     totals: dict[str, float] = {}  # one wallet may spread its bag over many token accounts
@@ -58,7 +59,7 @@ def holder_shares(holders: list[dict], supply: float | None,
             amount = float(h.get("amount") or 0)
         except (TypeError, ValueError):
             continue
-        if amount > 0:
+        if math.isfinite(amount) and amount > 0:
             totals[owner] = totals.get(owner, 0.0) + amount
     amounts = sorted(totals.values(), reverse=True)
     if not amounts:
@@ -77,7 +78,8 @@ def evaluate(token: dict, cfg: dict) -> list[CheckResult]:
     results: list[CheckResult] = []
 
     def numeric(name, value, rule, bad, fmt):
-        if value is None:
+        if (value is None or isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)):  # NaN compares False with everything: never a PASS
             results.append(CheckResult(name, UNKNOWN, None, rule, "no data"))
         elif bad(value):
             results.append(CheckResult(name, FAIL, value, rule, fmt(value)))

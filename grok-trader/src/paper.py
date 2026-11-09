@@ -12,10 +12,15 @@ until the next UTC day. Existing positions still get their stops checked.
 from __future__ import annotations
 
 import json
+import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from journal import iso
+
+
+def valid_price(p) -> bool:
+    return isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p) and p > 0
 
 
 class PaperBroker:
@@ -27,8 +32,15 @@ class PaperBroker:
     # ----- persistence -------------------------------------------------------
     def _load(self) -> dict:
         if os.path.exists(self.path):
-            with open(self.path, encoding="utf-8") as fh:
-                return json.load(fh)
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    state = json.load(fh)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"paper state {self.path} is unreadable ({exc}); "
+                                   f"move it aside to start fresh, or restore a backup") from None
+            if not isinstance(state, dict) or "balance_usd" not in state:
+                raise RuntimeError(f"paper state {self.path} has an unexpected shape; move it aside to start fresh")
+            return state
         start = float(self.cfg["paper_starting_balance_usd"])
         return {"balance_usd": start, "starting_balance_usd": start,
                 "positions": {}, "closed": [], "days": {}}
@@ -42,7 +54,7 @@ class PaperBroker:
 
     # ----- daily loss bookkeeping -------------------------------------------
     def _day(self, ts: datetime) -> dict:
-        key = ts.date().isoformat()
+        key = ts.astimezone(timezone.utc).date().isoformat()  # the day is always the UTC day
         day = self.state["days"].get(key)
         if day is None:
             invested = sum(p["cost_usd"] for p in self.state["positions"].values())
@@ -71,7 +83,7 @@ class PaperBroker:
         ok, why = self.can_open(mint, ts)
         if not ok:
             raise ValueError(why)
-        if not price or price <= 0:
+        if not valid_price(price):
             raise ValueError("invalid price")
         size = self.state["balance_usd"] * self.cfg["max_position_pct"]
         fee = size * self.cfg["paper_fee_pct"]
@@ -90,7 +102,7 @@ class PaperBroker:
     def mark(self, mint: str, price: float | None, ts: datetime) -> dict | None:
         """Update one position's last price; close it if stop or target is hit."""
         pos = self.state["positions"].get(mint)
-        if not pos or not price or price <= 0:
+        if not pos or not valid_price(price):
             return None
         pos["last_price"] = price
         if price <= pos["stop_price"]:
@@ -122,7 +134,7 @@ class PaperBroker:
     def equity(self) -> float:
         held = sum(p["qty"] * (p.get("last_price") or p["entry_price"])
                    for p in self.state["positions"].values())
-        return self.state["balance_usd"] + held
+        return self.state["balance_usd"] + held * (1 - self.cfg["paper_fee_pct"])  # what a close would yield
 
     def summary(self, ts: datetime) -> dict:
         closed = self.state["closed"]

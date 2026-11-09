@@ -59,11 +59,11 @@ def test_cycle_logs_errors_and_marks_tokens_seen(tmp_path, cfg, monkeypatch):
     monkeypatch.setattr(onchain, "gather", lambda *a, **k: ({"mint_authority": None, "errors": []}, None))
     bot.cycle()
     rows = [json.loads(l) for l in open(tmp_path / "d.jsonl")]
-    assert [r["action"] for r in rows] == ["skip", "error"] and "feed exploded" in rows[1]["reason"]
+    assert [r["action"] for r in rows] == ["skip", "error", "error"] and "feed exploded" in rows[1]["reason"]
     assert good in bot.seen and boom in bot.seen
-    assert "not-a-mint" in bot.seen and all(r["token"] != "not-a-mint" for r in rows)  # malformed: skipped quietly
+    assert "not-a-mint" in bot.seen and rows[2]["token"] == "not-a-mint" and "malformed" in rows[2]["reason"]
     bot.cycle()  # nothing new: no extra rows
-    assert len(open(tmp_path / "d.jsonl").readlines()) == 2
+    assert len(open(tmp_path / "d.jsonl").readlines()) == 3
 
 
 def test_feed_outage_is_journaled_not_fatal(tmp_path, cfg, monkeypatch):
@@ -77,13 +77,58 @@ def test_feed_outage_is_journaled_not_fatal(tmp_path, cfg, monkeypatch):
 def test_config_rejects_dangerous_values(tmp_path):
     base = json.load(open(main.os.path.join(main.ROOT, "config.json")))
     for key, bad in (("stop_loss_pct", 1.5), ("max_position_pct", 0), ("grok_max_risk", 11),
-                     ("poll_interval_seconds", "60"), ("max_single_holder", True)):
+                     ("poll_interval_seconds", "60"), ("max_single_holder", True),
+                     ("min_lp_locked_pct", 0), ("min_lp_locked_pct", 150), ("min_lp_locked_pct", "90"),
+                     ("max_new_tokens_per_cycle", 2.5), ("max_open_positions", 0.5)):
         (tmp_path / "c.json").write_text(json.dumps({**base, key: bad}))
         with pytest.raises(SystemExit):
             load_config(str(tmp_path / "c.json"))
-    base.pop("lp_provider")
+    base.pop("lp_provider"); base.pop("min_lp_locked_pct"); base["max_new_tokens_per_cycle"] = 10.0
     (tmp_path / "c.json").write_text(json.dumps(base))
-    assert load_config(str(tmp_path / "c.json"))["lp_provider"] == "rugcheck"
+    loaded = load_config(str(tmp_path / "c.json"))
+    assert loaded["lp_provider"] == "rugcheck" and loaded["min_lp_locked_pct"] == 90
+    assert loaded["max_new_tokens_per_cycle"] == 10 and isinstance(loaded["max_new_tokens_per_cycle"], int)
+
+
+def test_grok_is_not_paid_when_the_broker_would_refuse(tmp_path, cfg):
+    calls = []
+    mint, _, _, snapshot, token, reply = DEMO_TOKENS[0]
+
+    def grok_fn(payload):
+        calls.append(payload["mint"])
+        return reply
+
+    bot = Bot(cfg, paths(tmp_path), grok_fn=grok_fn, price_fn=lambda m: None, now_fn=lambda: T0)
+    assert bot.process_token(mint, dict(snapshot), dict(token), None)["action"] == "buy" and calls == [mint]
+    again = bot.process_token(mint, dict(snapshot), dict(token), None)  # already held: no Grok call
+    assert again["action"] == "skip" and "already holding" in again["reason"] and calls == [mint]
+    assert again["grok"] is None
+    bot.broker.state["days"][T0.date().isoformat()]["halted"] = True  # daily halt: no Grok call either
+    other = "Other" + "1" * 35
+    halted = bot.process_token(other, dict(snapshot), dict(token), None)
+    assert halted["action"] == "skip" and "daily loss limit" in halted["reason"] and calls == [mint]
+
+
+def test_dashboard_counts_are_all_time_and_readable(tmp_path, cfg):
+    from dashboard import create_app
+    bot = Bot(cfg, paths(tmp_path), price_fn=lambda m: None, now_fn=lambda: T0)
+    mint, _, _, snapshot, token, _ = DEMO_TOKENS[1]
+    for i in range(1200):  # more than the 50 shown and more than any fixed window
+        bot.process_token(f"Mint{i:03d}" + "1" * 30, dict(snapshot), dict(token), None)
+    client = create_app(bot).test_client()
+    state = client.get("/api/state").get_json()
+    assert state["stats"]["actions"] == {"skip": 1200} and len(state["decisions"]) == 50
+    page = client.get("/").data
+    assert b"Decisions, all time: 1200 skip" in page and b"Avg win / avg loss" in page
+
+
+def test_corrupt_paper_state_refuses_to_start(tmp_path, cfg, monkeypatch):
+    monkeypatch.setattr(main, "ROOT", str(tmp_path))
+    state = tmp_path / "data" / "paper_state.json"
+    state.parent.mkdir()
+    state.write_text("{not json")
+    monkeypatch.setenv("XAI_API_KEY", "x")
+    assert main.main(["--once", "--no-dashboard"]) == 3
 
 
 def test_dashboard_refuses_foreign_host_headers_and_bad_log_lines(tmp_path, cfg):

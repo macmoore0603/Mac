@@ -82,3 +82,13 @@ def test_holder_shares_sum_token_accounts_per_wallet():
     unknown_owner = [{"address": "x", "amount": "50", "owner": None}, {"address": "y", "amount": "50", "owner": None}]
     assert holder_shares(unknown_owner, 1000) == (0.05, 0.10)  # no owner: each account is its own wallet
     assert holder_shares([{"address": "z", "amount": "abc", "owner": "w"}], 1000) == (None, None)
+
+
+def test_non_finite_and_non_numeric_values_are_unknown():
+    import math
+    for bad in (math.nan, math.inf, -math.inf, True, "50000", [1]):
+        assert status("liquidity", {**GOOD, "liquidity_usd": bad}) == UNKNOWN, bad
+        assert status("largest_holder", {**GOOD, "largest_holder_share": bad}) == UNKNOWN, bad
+    assert holder_shares([{"address": "a", "amount": "1", "owner": "w"}], math.nan) == (None, None)
+    assert holder_shares([{"address": "a", "amount": "1", "owner": "w"}], math.inf) == (None, None)
+    assert holder_shares([{"address": "a", "amount": "inf", "owner": "w"}], 1000) == (None, None)

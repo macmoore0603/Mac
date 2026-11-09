@@ -19,7 +19,7 @@ def test_open_sizes_position_and_charges_fee(tmp_path):
     assert pos["cost_usd"] == 20.0 and pos["entry_fee_usd"] == pytest.approx(0.2)
     assert pos["qty"] == pytest.approx(19.8 / 2.0)
     assert pos["stop_price"] == pytest.approx(1.5) and pos["take_profit_price"] == pytest.approx(3.0)
-    assert b.state["balance_usd"] == 980.0 and b.equity() == pytest.approx(980.0 + 19.8)
+    assert b.state["balance_usd"] == 980.0 and b.equity() == pytest.approx(980.0 + 19.8 * 0.99)
 
 
 def test_stop_loss_and_take_profit(tmp_path):
@@ -85,3 +85,31 @@ def test_new_day_starts_from_pre_trade_equity(tmp_path):
     assert rec["reason"] == "stop_loss"
     day2 = b.state["days"][(T0 + timedelta(days=1)).date().isoformat()]
     assert day2["start_equity"] == pytest.approx(1000.0) and day2["halted"] is True
+
+
+def test_non_finite_prices_are_rejected(tmp_path):
+    import math
+    b = broker(tmp_path)
+    for bad in (math.nan, math.inf, -math.inf, True, "1.0", None, 0, -1):
+        with pytest.raises(ValueError):
+            b.open("A", "A", bad, T0)
+    b.open("A", "A", 1.0, T0)
+    assert b.mark("A", math.nan, T0) is None and b.mark("A", math.inf, T0) is None and "A" in b.state["positions"]
+    assert b.mark("A", 0.5, T0)["reason"] == "stop_loss"
+
+
+def test_day_key_is_utc_even_for_other_timezones(tmp_path):
+    from datetime import timedelta, timezone as tz
+    b = broker(tmp_path)
+    late_in_new_york = datetime(2026, 1, 1, 22, tzinfo=tz(timedelta(hours=-5)))  # 03:00 UTC on Jan 2
+    b._day(late_in_new_york)
+    assert list(b.state["days"]) == ["2026-01-02"]
+
+
+def test_corrupt_state_file_raises_a_clear_error(tmp_path):
+    (tmp_path / "state.json").write_text("{oops")
+    with pytest.raises(RuntimeError, match="unreadable"):
+        broker(tmp_path)
+    (tmp_path / "state.json").write_text("[]")
+    with pytest.raises(RuntimeError, match="unexpected shape"):
+        broker(tmp_path)

@@ -28,8 +28,8 @@ def append(path: str, record: dict) -> dict:
     return record
 
 
-def tail(path: str, n: int = 50) -> list[dict]:
-    """Last `n` records, oldest first. Skips corrupt lines instead of crashing."""
+def tail(path: str, n: int | None = 50) -> list[dict]:
+    """Last `n` records (None = all), oldest first. Skips corrupt lines instead of crashing."""
     if not os.path.exists(path):
         return []
     last: deque[str] = deque(maxlen=n)

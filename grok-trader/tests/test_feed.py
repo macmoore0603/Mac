@@ -117,3 +117,11 @@ def test_get_json_does_not_sleep_after_the_last_attempt(monkeypatch):
     with pytest.raises(feed.FeedError):
         feed.get_json(FakeSession({("GET", "x"): [FakeResponse(503)]}), "https://x/", retries=3)
     assert sleeps == [0, 1]
+
+
+def test_num_rejects_non_finite_values():
+    for bad in ("NaN", "Infinity", "-inf", "1e400", float("nan"), True, None, "abc"):
+        assert feed._num(bad) is None, bad
+    assert feed._num("1.5") == 1.5 and feed._num(2) == 2.0
+    snap = feed.pool_snapshot({**pair(1e400, price="NaN"), "pairCreatedAt": 1e400}, 1_700_000_000_000)
+    assert snap["liquidity_usd"] is None and snap["price_usd"] is None and snap["pool_age_minutes"] is None

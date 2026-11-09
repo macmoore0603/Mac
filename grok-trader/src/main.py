@@ -63,6 +63,13 @@ def load_config(path: str) -> dict:
             sys.exit(f"config.json: {k} must be zero or more, got {cfg[k]!r}")
     if not _number(cfg["grok_max_risk"]) or not 0 <= cfg["grok_max_risk"] <= 10:
         sys.exit(f"config.json: grok_max_risk must be between 0 and 10, got {cfg['grok_max_risk']!r}")
+    pct = cfg.setdefault("min_lp_locked_pct", 90)
+    if not _number(pct) or not 0 < pct <= 100:
+        sys.exit(f"config.json: min_lp_locked_pct must be a percentage in (0, 100], got {pct!r}")
+    for k in ("max_new_tokens_per_cycle", "max_open_positions"):  # counts: whole numbers only
+        if cfg[k] != int(cfg[k]):
+            sys.exit(f"config.json: {k} must be a whole number, got {cfg[k]!r}")
+        cfg[k] = int(cfg[k])
     cfg.setdefault("lp_provider", "rugcheck")
     return cfg
 
@@ -96,10 +103,16 @@ class Bot:
             token.setdefault(key, snapshot.get(key))
         results = checks.evaluate(token, self.cfg)
         rug = onchain.risk_summary(report)
-        grok_res = None
-        if checks.all_pass(results):  # only clean tokens cost Grok tokens
-            grok_res = self.grok_fn(grok.build_payload(mint, snapshot, token, results, rug))
+        grok_res, blocked = None, None
+        if checks.all_pass(results):  # only clean tokens cost Grok tokens...
+            with self.lock:  # ...and only when the broker could act on the answer
+                ok, why = self.broker.can_open(mint, ts)
+            blocked = None if ok else why
+            if blocked is None:
+                grok_res = self.grok_fn(grok.build_payload(mint, snapshot, token, results, rug))
         decision = scoring.decide(results, grok_res, self.cfg)
+        if blocked:
+            decision = scoring.Decision(scoring.SKIP, decision.score, f"would qualify, but {blocked}")
         record = {"ts": journal.iso(ts), "action": decision.action, "token": mint,
                   "symbol": snapshot.get("symbol"), "pair": snapshot.get("pair_address"),
                   "price_usd": snapshot.get("price_usd"), "score": decision.score, "reason": decision.reason,
@@ -156,6 +169,8 @@ class Bot:
         for mint in fresh[: self.cfg["max_new_tokens_per_cycle"]]:
             if not MINT_RE.match(mint):  # never put an odd string into a URL or an RPC call
                 log.warning("skipping malformed token address %r", mint[:60])
+                journal.append(self.paths["log"], {"action": "error", "token": mint[:60], "symbol": None,
+                                                   "score": None, "reason": "malformed token address from the feed"})
                 self.seen.add(mint, journal.iso(self.now()))
                 continue
             try:
@@ -245,8 +260,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.demo:
         return run_demo(cfg)
 
-    bot = Bot(cfg, make_paths(), rpc_url=os.getenv("SOLANA_RPC_URL") or onchain.DEFAULT_RPC_URL,
-              api_key=os.getenv("XAI_API_KEY"))
+    try:
+        bot = Bot(cfg, make_paths(), rpc_url=os.getenv("SOLANA_RPC_URL") or onchain.DEFAULT_RPC_URL,
+                  api_key=os.getenv("XAI_API_KEY"))
+    except RuntimeError as exc:  # e.g. a corrupt paper state file: refuse to start, never reset silently
+        print(f"cannot start: {exc}")
+        return 3
     if not bot.api_key or bot.api_key == "your_key_here":
         log.warning("XAI_API_KEY is not set: every token will be skipped at the Grok step (no paper trades).")
     if bot.rpc_url == onchain.DEFAULT_RPC_URL:
